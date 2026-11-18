@@ -19,6 +19,60 @@ function textCharacters(text) {
   return (text.match(/[\p{L}\p{N}]/gu) ?? []).length
 }
 
+function inspectText(paragraphs) {
+  const text = paragraphs.map(paragraph => paragraph.text).join(' ').normalize('NFC')
+  const visible = text.replace(/\s/g, '')
+  const characters = textCharacters(visible)
+  const letters = (visible.match(/\p{L}/gu) ?? []).length
+  const badGlyphs = (visible.match(/[\uFFFD\p{Co}\p{Cc}]/gu) ?? []).length
+  const noisySymbols = (visible.match(/[*#|~`^\\]/g) ?? []).length
+  const invalidEncoding = badGlyphs > 0 && (badGlyphs === visible.length || badGlyphs >= 3 && badGlyphs / visible.length >= 0.06)
+
+  // A damaged character map can expose private glyphs or punctuation instead of text.
+  if (invalidEncoding || noisySymbols >= 8 && noisySymbols / visible.length >= 0.65) {
+    return { characters, visible: visible.length, wordCharacters: 0, suspect: true }
+  }
+
+  const words = text.match(/\p{L}[\p{L}\p{M}]*/gu) ?? []
+  let latinLetters = 0
+  let shortLetters = 0
+  let singleLetters = 0
+  let wordLetters = 0
+  for (const word of words) {
+    if (!/^[\p{Script=Latin}\p{M}]+$/u.test(word)) continue
+    // Accents and case still count as ordinary vowels in a Latin-script word.
+    const plain = word.toLowerCase().normalize('NFD').replace(/\p{M}/gu, '')
+    const length = [...plain].length
+    latinLetters += length
+    if (length <= 2) shortLetters += length
+    if (length === 1) singleLetters++
+    if (length >= 3 && /[aeiouyæœøı]/.test(plain) && !/(.)\1{3,}/u.test(plain)) wordLetters += length
+  }
+
+  const latinPage = latinLetters >= 16 && latinLetters >= letters * 0.85
+  const fragmented = shortLetters >= latinLetters * 0.65 && singleLetters >= latinLetters * 0.23
+  const noisy = noisySymbols >= 4 && noisySymbols / visible.length >= 0.12
+  const sparse = characters / visible.length < 0.58
+  const missingWords = latinLetters >= 45 && wordLetters < latinLetters * 0.10
+  // Some broken maps output entirely printable text, often as isolated capitals
+  // and symbols. Look for weak word structure and corroborating evidence.
+  const suspect = latinPage && (missingWords || wordLetters < latinLetters * 0.42 && (fragmented || noisy || sparse))
+  return { characters, visible: visible.length, wordCharacters: wordLetters + (letters - latinLetters), suspect }
+}
+
+function ocrRecovered(data, recognized, native) {
+  const quality = inspectText(recognized)
+  if (quality.suspect) return false
+  if (native.suspect) {
+    // Corrupted maps can emit several glyphs per real letter. Compare usable
+    // recovery to a lower bound, so extra gibberish cannot win on length alone.
+    const minimumCharacters = Math.max(4, Math.min(100, Math.ceil(native.visible * 0.14)))
+    return data.confidence >= 55 && quality.characters >= minimumCharacters &&
+      quality.wordCharacters >= Math.max(3, minimumCharacters * 0.50)
+  }
+  return data.confidence >= 42 && quality.characters > Math.max(3, native.characters)
+}
+
 function textLines(content, viewport) {
   const lines = []
   let line
@@ -329,14 +383,19 @@ export async function importPdf(file, { language = 'por+eng', onProgress = () =>
         const viewport = page.getViewport({ scale: 1 })
         const lines = textLines(await page.getTextContent(), viewport)
         let paragraphs = digitalParagraphs(lines, viewport)
-        const nativeCharacters = textCharacters(paragraphs.map(paragraph => paragraph.text).join(' '))
-        canvas = await renderPage(page, viewport, nativeCharacters < 70 ? 1900 : 1350)
+        const native = inspectText(paragraphs)
+        canvas = await renderPage(page, viewport, native.suspect || native.characters < 70 ? 1900 : 1350)
         if (current === 1) thumbnail = imageData(canvas, wholePage, 280)
         let images = pageImages(page.imageCoordinates ?? [])
         const scanImage = images.some(image => area(image) > 0.65)
-        if (nativeCharacters < 70 && (nativeCharacters < 4 || scanImage)) {
+        if (native.suspect || (native.characters < 70 && (native.characters < 4 || scanImage))) {
           const sample = sampledPage(canvas)
-          if (hasPageContent(sample) && !ocrUnavailable) {
+          const hasContent = hasPageContent(sample)
+          if (native.suspect) {
+            paragraphs = []
+            if (!hasContent) throw new Error(`Não foi possível recuperar o texto nem a imagem da página ${current}.`)
+          }
+          if (hasContent && !ocrUnavailable) {
             onProgress({ stage: 'ocr', current, total })
             try {
               ocrWorker ??= await startOcr(language, ({ progress, status }) => {
@@ -344,8 +403,7 @@ export async function importPdf(file, { language = 'por+eng', onProgress = () =>
               })
               const { data } = await ocrWorker.recognize(canvas, {}, { blocks: true, text: true })
               const recognized = ocrParagraphs(data, canvas)
-              const recognizedCharacters = textCharacters(recognized.map(paragraph => paragraph.text).join(' '))
-              if (data.confidence >= 42 && recognizedCharacters > Math.max(3, nativeCharacters)) {
+              if (ocrRecovered(data, recognized, native)) {
                 paragraphs = recognized
                 images = images.filter(image => area(image) <= 0.65 &&
                   !paragraphs.some(paragraph => intersectionArea(image, paragraph) > area(image) * 0.25))
@@ -356,7 +414,7 @@ export async function importPdf(file, { language = 'por+eng', onProgress = () =>
               ocrUnavailable = true
             }
           }
-          if (!paragraphs.length && !images.length && hasPageContent(sample)) images.push(wholePage)
+          if (!paragraphs.length && hasContent && (native.suspect || !images.length)) images = [wholePage]
           if (!paragraphs.length && images.length) fallbackPages.push(current)
         } else {
           // Searchable scans already carry a text layer. Keep their text and recover figures.

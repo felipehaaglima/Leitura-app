@@ -4,6 +4,7 @@ import { sampleBooks } from './samples.js'
 const app = document.querySelector('#app')
 const dialog = document.querySelector('#dialog')
 const toast = document.querySelector('#toast')
+const themeColor = document.querySelector('meta[name="theme-color"]')
 
 const icons = {
   logo: '<path d="M5 4.75h6.2c1 0 1.8.42 2.8 1.42 1-1 1.8-1.42 2.8-1.42H21v13h-4.2c-1 0-1.8.42-2.8 1.42-1-1-1.8-1.42-2.8-1.42H5z"/><path d="M14 6.4v12.1M5 19.8h6.2c1 0 1.8.42 2.8 1.42 1-1 1.8-1.42 2.8-1.42H21"/>',
@@ -226,6 +227,7 @@ async function renderHighlights() {
 }
 
 function renderShell() {
+  themeColor?.setAttribute('content', '#f8f6ef')
   readerCleanup?.()
   readerCleanup = undefined
   readerBook = undefined
@@ -319,7 +321,7 @@ function showAccount() {
 function showUpload() {
   if (!user) return showAuth('login', showUpload)
   showDialog('Importar PDF', `
-    <p class="modal-description">O texto será extraído para o leitor. Páginas digitalizadas serão reconhecidas com OCR em português e inglês.</p>
+    <p class="modal-description">O texto será extraído para o leitor. Para páginas escaneadas ou com caracteres ilegíveis, o app tenta reconhecer o texto em português e inglês.</p>
     <form id="upload-form" class="modal-form">
       <label class="file-drop">${icon('upload')}<strong>Escolha um arquivo PDF</strong><small>Até 80 MB e 500 páginas</small><input type="file" name="file" accept=".pdf,application/pdf" required></label>
       <label>Título opcional<input name="title" maxlength="240" placeholder="Usar o título do PDF"></label>
@@ -445,6 +447,7 @@ async function openBook(id, explicitPage) {
         books = books.map(item => item.id === id ? { ...item, highlightCount: Math.max(0, (item.highlightCount ?? 1) - 1) } : item)
       },
     })
+    themeColor?.setAttribute('content', '#ffffff')
     if (explicitPage !== undefined) void savePosition(explicitPage).catch(error => announce(error.message))
     window.scrollTo(0, 0)
   } catch (error) {

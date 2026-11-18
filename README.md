@@ -34,8 +34,8 @@ O servidor cria as tabelas na primeira operação que precisa do banco. Na Verce
 
 ## Leitura e dados
 
-- Clique nas laterais do leitor ou use as setas do teclado para avançar e voltar. Também é possível digitar o número da página.
+- Toque nas laterais do leitor ou use as setas do teclado para avançar e voltar. Toque no centro para abrir os controles, incluindo o campo para ir a uma página.
 - Selecione uma palavra ou um trecho para destacar, consultar o Wikcionário ou abrir a tradução no Google Tradutor. Esses links enviam o termo ou o trecho selecionado ao serviço escolhido.
-- O PDF é processado no navegador. O Tesseract reconhece texto em português e inglês de páginas digitalizadas. O arquivo original permanece no dispositivo e o servidor recebe o texto e as imagens preparados para o leitor.
+- O PDF é processado no navegador. O Tesseract reconhece texto em português e inglês em páginas digitalizadas ou com uma camada de texto ilegível. O arquivo original permanece no dispositivo e o servidor recebe o texto e as imagens preparados para o leitor. Para recuperar um livro afetado por caracteres ilegíveis em uma importação anterior, importe novamente o PDF original.
 - A importação aceita PDFs de até 80 MB e 500 páginas. A recuperação de texto e figuras depende da qualidade do escaneamento e do layout. Páginas em que o OCR não encontra texto legível podem aparecer como imagem.
 - PDFs importados, destaques e última página são salvos por conta. O progresso do acervo aberto e as preferências do leitor ficam no navegador.

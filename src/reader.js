@@ -1,3 +1,4 @@
+import "@fontsource/tinos/latin-400.css";
 import "./reader.css";
 
 const icons = {
@@ -18,7 +19,7 @@ const tones = {
   pink: "Rosa",
 };
 
-const defaultPreferences = { size: 21, theme: "light", target: "pt" };
+const defaultPreferences = { size: 21, target: "pt" };
 const readingSettingsKey = "leitura.reader.settings";
 
 function icon(name) {
@@ -31,7 +32,6 @@ function readPreferences() {
     if (!saved) return { ...defaultPreferences };
     return {
       size: Number.isInteger(saved.size) && saved.size >= 15 && saved.size <= 33 ? saved.size : defaultPreferences.size,
-      theme: ["light", "sepia", "dark"].includes(saved.theme) ? saved.theme : defaultPreferences.theme,
       target: ["pt", "en", "es", "fr", "de", "it"].includes(saved.target) ? saved.target : defaultPreferences.target,
     };
   } catch {
@@ -98,8 +98,11 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   let highlights = [...(book.highlights ?? [])];
   let positionUpdates = Promise.resolve();
   let preferences = readPreferences();
+  let controlsOpen = false;
   let selectionData;
   let activePanel;
+  let tap;
+  let tapTimer;
   let selectionTimer;
   let notificationTimer;
 
@@ -108,7 +111,7 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   const element = document.createElement("div");
   element.className = "lr-reader";
   element.innerHTML = `
-    <header class="lr-header">
+    <header class="lr-header" id="lr-reader-tools" hidden>
       <button type="button" class="lr-back" aria-label="Voltar à biblioteca">${icon("library")}<span>Biblioteca</span></button>
       <h1 class="lr-title"></h1>
       <div class="lr-header-actions">
@@ -116,23 +119,26 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
         <button type="button" class="lr-header-control" data-toggle="highlights" aria-controls="lr-highlights" aria-expanded="false" aria-label="Destaques" title="Destaques">${icon("bookmark")}</button>
       </div>
     </header>
-    <div class="lr-workspace">
-      <main class="lr-scroll" aria-label="Área de leitura">
-        <article class="lr-paper" aria-label="Página de leitura"></article>
-      </main>
-      <button type="button" class="lr-edge lr-edge-left" aria-label="Voltar página" title="Voltar página" data-step="-1">${icon("left")}</button>
-      <button type="button" class="lr-edge lr-edge-right" aria-label="Avançar página" title="Avançar página" data-step="1">${icon("right")}</button>
-    </div>
+    <main class="lr-scroll" aria-label="Área de leitura">
+      <article class="lr-paper" aria-label="Página de leitura"></article>
+    </main>
     <footer class="lr-footer">
-      <progress aria-label="Progresso da leitura"></progress>
-      <a class="lr-source" target="_blank" rel="noopener noreferrer" hidden>Ler obra completa na Wikisource</a>
-      <form class="lr-page-form">
-        <label for="lr-page-number">Página</label>
-        <input id="lr-page-number" type="text" inputmode="numeric" pattern="[0-9]+" autocomplete="off" required>
-        <span class="lr-page-total"></span>
-        <button type="submit" class="lr-screen-reader-only">Ir à página</button>
-      </form>
-      <span class="lr-percent" aria-hidden="true"></span>
+      <button type="button" class="lr-counter" aria-controls="lr-reader-tools lr-reader-navigation" aria-expanded="false"></button>
+      <div class="lr-navigation" id="lr-reader-navigation" hidden>
+        <progress aria-label="Progresso da leitura"></progress>
+        <a class="lr-source" target="_blank" rel="noopener noreferrer" hidden>Ler obra completa na Wikisource</a>
+        <div class="lr-pagination">
+          <button type="button" class="lr-page-step" aria-label="Voltar página" title="Voltar página" data-step="-1">${icon("left")}</button>
+          <form class="lr-page-form">
+            <label for="lr-page-number">Página</label>
+            <input id="lr-page-number" type="text" inputmode="numeric" pattern="[0-9]+" autocomplete="off" required>
+            <span class="lr-page-total"></span>
+            <button type="submit" class="lr-screen-reader-only">Ir à página</button>
+          </form>
+          <button type="button" class="lr-page-step" aria-label="Avançar página" title="Avançar página" data-step="1">${icon("right")}</button>
+        </div>
+        <span class="lr-percent" aria-hidden="true"></span>
+      </div>
       <span class="lr-status" role="status"></span>
     </footer>
     <section id="lr-appearance" class="lr-panel" data-panel="appearance" aria-labelledby="lr-appearance-title" hidden>
@@ -145,12 +151,6 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
           <button type="button" aria-label="Aumentar texto" data-size="1">A+</button>
         </div>
       </div>
-      <fieldset class="lr-themes">
-        <legend>Tema</legend>
-        <button type="button" data-reader-theme="light" aria-pressed="false">Claro</button>
-        <button type="button" data-reader-theme="sepia" aria-pressed="false">Sépia</button>
-        <button type="button" data-reader-theme="dark" aria-pressed="false">Escuro</button>
-      </fieldset>
       <label class="lr-panel-row" for="lr-language">Traduzir para
         <select id="lr-language">
           <option value="pt">Português</option><option value="en">Inglês</option>
@@ -177,6 +177,9 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   const find = (selector) => element.querySelector(selector);
   const scroll = find(".lr-scroll");
   const article = find(".lr-paper");
+  const header = find(".lr-header");
+  const counter = find(".lr-counter");
+  const navigation = find(".lr-navigation");
   const numberInput = find("#lr-page-number");
   const status = find(".lr-status");
   const progress = find("progress");
@@ -193,7 +196,7 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
     const source = find(".lr-source");
     source.href = book.source;
     source.hidden = false;
-    find(".lr-footer").classList.add("lr-footer-with-source");
+    navigation.classList.add("lr-navigation-with-source");
   }
   root.replaceChildren(element);
 
@@ -205,21 +208,41 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   }
 
   function displayPreferences(persist = false) {
-    element.dataset.theme = preferences.theme;
     element.style.setProperty("--lr-text-size", `${preferences.size / 16}rem`);
     find(".lr-size-value").textContent = preferences.size;
     find("#lr-language").value = preferences.target;
     find("[data-size='-1']").disabled = preferences.size <= 15;
     find("[data-size='1']").disabled = preferences.size >= 33;
-    for (const button of element.querySelectorAll("[data-reader-theme]")) {
-      button.setAttribute("aria-pressed", String(button.dataset.readerTheme === preferences.theme));
-    }
     if (persist) {
       try {
         localStorage.setItem(readingSettingsKey, JSON.stringify(preferences));
       } catch {
         announce("As preferências valem até fechar esta aba.");
       }
+    }
+  }
+
+  function displayCounter() {
+    const current = count ? page + 1 : 0;
+    counter.textContent = `${current} / ${count}`;
+    counter.setAttribute("aria-label", `Página ${current} de ${count}. ${controlsOpen ? "Ocultar" : "Mostrar"} controles de leitura`);
+  }
+
+  function showControls(open, moveFocus = false) {
+    clearTimeout(tapTimer);
+    const focused = document.activeElement;
+    const focusInControls = header.contains(focused) || navigation.contains(focused) ||
+      (activePanel && find(`[data-panel="${activePanel}"]`).contains(focused));
+    controlsOpen = open;
+    header.hidden = !open;
+    navigation.hidden = !open;
+    counter.setAttribute("aria-expanded", String(open));
+    displayCounter();
+    if (!open) {
+      showPanel(null);
+      if (focusInControls) counter.focus({ preventScroll: true });
+    } else if (moveFocus) {
+      find(".lr-back").focus({ preventScroll: true });
     }
   }
 
@@ -275,18 +298,20 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
 
     article.replaceChildren(blocks);
     article.setAttribute("aria-label", count ? `Página ${page + 1} de ${count}` : "Página de leitura");
-    find(".lr-edge-left").disabled = page <= 0;
-    find(".lr-edge-right").disabled = page >= count - 1;
+    find('[data-step="-1"]').disabled = page <= 0;
+    find('[data-step="1"]').disabled = page >= count - 1;
     numberInput.value = count ? page + 1 : 0;
     numberInput.disabled = !count;
     progress.value = count ? page + 1 : 0;
     find(".lr-percent").textContent = `${count ? Math.round((page + 1) / count * 100) : 0}%`;
+    displayCounter();
   }
 
   function goTo(next) {
     const destination = Math.max(0, Math.min(next, count - 1));
     if (!count || !Number.isInteger(destination) || destination === page) return;
 
+    clearTimeout(tapTimer);
     page = destination;
     window.getSelection()?.removeAllRanges();
     hideSelection();
@@ -398,6 +423,9 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   }
 
   find(".lr-back").addEventListener("click", onExit, { signal });
+  counter.addEventListener("click", (event) => {
+    if (event.detail === 0) showControls(!controlsOpen, true);
+  }, { signal });
   element.addEventListener("click", async (event) => {
     const step = event.target.closest("[data-step]");
     if (step) goTo(page + Number(step.dataset.step));
@@ -411,12 +439,6 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
       preferences = { ...preferences, size: preferences.size + Number(size.dataset.size) };
       displayPreferences(true);
     }
-    const theme = event.target.closest("[data-reader-theme]");
-    if (theme) {
-      preferences = { ...preferences, theme: theme.dataset.readerTheme };
-      displayPreferences(true);
-    }
-
     if (event.target.closest("[data-highlight-toggle]") && selectionData) {
       colors.hidden = !colors.hidden;
       colorToggle.setAttribute("aria-expanded", String(!colors.hidden));
@@ -464,12 +486,51 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   numberInput.addEventListener("change", jumpFromInput, { signal });
   numberInput.addEventListener("focus", () => numberInput.select(), { signal });
 
-  article.addEventListener("click", (event) => {
-    if (event.target !== article || !window.getSelection()?.isCollapsed) return;
-    const bounds = article.getBoundingClientRect();
-    const padding = Number.parseFloat(getComputedStyle(article).paddingInlineStart);
-    if (event.clientX < bounds.left + padding) goTo(page - 1);
-    if (event.clientX > bounds.right - padding) goTo(page + 1);
+  scroll.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    tap = {
+      id: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      type: event.pointerType,
+      blocked: Boolean(activePanel) || !selectionMenu.hidden || !window.getSelection()?.isCollapsed,
+    };
+  }, { signal });
+
+  scroll.addEventListener("pointermove", (event) => {
+    if (tap?.id === event.pointerId &&
+        Math.hypot(event.clientX - tap.x, event.clientY - tap.y) > 10) {
+      tap.blocked = true;
+    }
+  }, { signal, passive: true });
+
+  scroll.addEventListener("pointercancel", () => {
+    if (tap) tap.blocked = true;
+  }, { signal });
+
+  scroll.addEventListener("click", (event) => {
+    clearTimeout(tapTimer);
+    const gesture = tap;
+    tap = null;
+    if (event.defaultPrevented || event.button !== 0 || (gesture?.type !== "touch" && event.detail > 1) || gesture?.blocked ||
+        !selectionMenu.hidden || !window.getSelection()?.isCollapsed ||
+        event.target.closest("a, button, input, img, mark")) return;
+
+    const bounds = scroll.getBoundingClientRect();
+    const fraction = (event.clientX - bounds.left) / bounds.width;
+    if (!Number.isFinite(fraction) || fraction < 0 || fraction > 1) return;
+    const readText = event.target.closest("[data-reader-block]");
+    if (fraction < 0.25 || fraction > 0.75) {
+      if (!readText) goTo(page + (fraction > 0.75 ? 1 : -1));
+      return;
+    }
+    if (readText && gesture?.type !== "touch") {
+      tapTimer = setTimeout(() => {
+        if (window.getSelection()?.isCollapsed) showControls(!controlsOpen);
+      }, 240);
+    } else {
+      showControls(!controlsOpen);
+    }
   }, { signal });
 
   selectionMenu.addEventListener("mousedown", (event) => event.preventDefault(), { signal });
@@ -480,6 +541,7 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   }, { signal });
 
   document.addEventListener("selectionchange", () => {
+    if (!window.getSelection()?.isCollapsed) clearTimeout(tapTimer);
     clearTimeout(selectionTimer);
     selectionTimer = setTimeout(displaySelection, 70);
   }, { signal });
@@ -491,11 +553,11 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
 
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      if (activePanel) showPanel(null, true);
       if (!selectionMenu.hidden) {
         window.getSelection()?.removeAllRanges();
         hideSelection();
-      }
+      } else if (activePanel) showPanel(null, true);
+      else if (controlsOpen) showControls(false);
       return;
     }
     if (activePanel || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey ||
@@ -520,6 +582,7 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
 
   return () => {
     controller.abort();
+    clearTimeout(tapTimer);
     clearTimeout(selectionTimer);
     clearTimeout(notificationTimer);
   };
