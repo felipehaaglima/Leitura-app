@@ -127,6 +127,7 @@ async function openPostgres(connectionString) {
     connectionTimeoutMillis: 8_000,
     idleTimeoutMillis: 10_000,
     allowExitOnIdle: true,
+    enableChannelBinding: true,
   });
   pool.on('error', (error) => console.error('Falha em conexão ociosa com o banco.', error.code));
 

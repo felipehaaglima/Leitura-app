@@ -38,7 +38,6 @@ const storage = createStorage({ connectionString: process.env.DATABASE_URL, dire
 function prepare(sql) {
   return {
     get: (...args) => storage.get(sql, ...args),
-    all: (...args) => storage.all(sql, ...args),
     run: (...args) => storage.run(sql, ...args),
   };
 }
@@ -66,6 +65,10 @@ const listAccountHighlightsSql = `
   WHERE books.owner_id = ?
   ORDER BY books.updated_at DESC, books.id, page, block, "start", highlights.created_at, highlights.id
 `;
+const getBlockSql = storage.postgres
+  ? `SELECT (pages_json::jsonb -> (?::integer) -> 'blocks' -> (?::integer))::text AS block
+     FROM books WHERE id = ? AND owner_id = ?${storage.forUpdate}`
+  : 'SELECT json_extract(pages_json, ?) AS block FROM books WHERE id = ? AND owner_id = ?';
 
 const queries = {
   userByEmail: prepare('SELECT * FROM users WHERE email = ?'),
@@ -87,11 +90,6 @@ const queries = {
     UPDATE books SET current_page = ?, updated_at = ?
     WHERE id = ? AND owner_id = ? AND page_count > ?
   `),
-  getBlock: prepare(storage.postgres
-    ? `SELECT (pages_json::jsonb -> (?::integer) -> 'blocks' -> (?::integer))::text AS block
-       FROM books WHERE id = ? AND owner_id = ?`
-    : 'SELECT json_extract(pages_json, ?) AS block FROM books WHERE id = ? AND owner_id = ?'),
-  createHighlight: prepare('INSERT INTO highlights VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
   deleteHighlight: prepare(`
     DELETE FROM highlights
     WHERE id = ? AND book_id IN (SELECT id FROM books WHERE id = ? AND owner_id = ?)
@@ -140,7 +138,7 @@ async function readJson(request, maxBytes = maxSmallRequestBytes) {
   if (providedBody !== undefined) {
     const source = Buffer.isBuffer(providedBody) ? providedBody.toString('utf8') : providedBody;
     const serialized = typeof source === 'string' ? source : JSON.stringify(source);
-    if (Buffer.byteLength(serialized) > maxBytes) {
+    if (typeof serialized === 'string' && Buffer.byteLength(serialized) > maxBytes) {
       throw new HttpError(413, 'O conteúdo do arquivo é grande demais.');
     }
     return parseJson(source);
@@ -220,7 +218,7 @@ setInterval(() => {
 
 function checkAuthRate(request, hosted) {
   const forwarded = hosted && request.headers['x-vercel-forwarded-for'];
-  const ip = typeof forwarded === 'string' ? forwarded : request.socket.remoteAddress;
+  const ip = typeof forwarded === 'string' ? forwarded : request.socket?.remoteAddress;
   const now = Date.now();
   const entry = attempts.get(ip);
   if (!entry || entry.resetAt <= now) {
@@ -336,7 +334,7 @@ function notFound() {
 
 async function saveProgress(request, response, bookId, userId) {
   const { page } = await readJson(request);
-  if (!Number.isSafeInteger(page) || page < 0) throw new HttpError(400, 'Página inválida.');
+  if (!Number.isSafeInteger(page) || page < 0 || page >= 2_000) throw new HttpError(400, 'Página inválida.');
 
   const result = await queries.updateProgress.run(page, new Date().toISOString(), bookId, userId, page);
   if (result.changes === 0) {
@@ -360,20 +358,24 @@ async function saveHighlight(request, response, bookId, userId) {
   }
 
   const blockLocation = storage.postgres ? [page, block] : [`$[${page}].blocks[${block}]`];
-  const row = await queries.getBlock.get(...blockLocation, bookId, userId);
-  if (!row) throw notFound();
-  const target = row.block ? JSON.parse(row.block) : null;
-  if (target?.type !== 'text' || end > target.text.length
-      || splitsSurrogate(target.text, start) || splitsSurrogate(target.text, end)) {
-    throw new HttpError(400, 'Seleção de texto inválida.');
-  }
-  const text = target.text.slice(start, end);
-  if (!text.trim()) throw new HttpError(400, 'Selecione uma palavra ou frase.');
+  const highlight = await storage.transaction(async (connection) => {
+    const row = await connection.get(getBlockSql, ...blockLocation, bookId, userId);
+    if (!row) throw notFound();
+    const target = row.block ? JSON.parse(row.block) : null;
+    if (target?.type !== 'text' || end > target.text.length
+        || splitsSurrogate(target.text, start) || splitsSurrogate(target.text, end)) {
+      throw new HttpError(400, 'Seleção de texto inválida.');
+    }
+    const text = target.text.slice(start, end);
+    if (!text.trim()) throw new HttpError(400, 'Selecione uma palavra ou frase.');
 
-  const id = randomUUID();
-  const createdAt = new Date().toISOString();
-  await queries.createHighlight.run(id, bookId, page, block, start, end, cleanText(text), color, createdAt);
-  respondJson(response, 201, { highlight: { id, page, block, start, end, text, color, createdAt } });
+    const id = randomUUID();
+    const createdAt = new Date().toISOString();
+    await connection.run('INSERT INTO highlights VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      id, bookId, page, block, start, end, cleanText(text), color, createdAt);
+    return { id, page, block, start, end, text, color, createdAt };
+  });
+  respondJson(response, 201, { highlight });
 }
 
 function importNotFound() {
