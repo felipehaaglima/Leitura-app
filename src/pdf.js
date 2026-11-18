@@ -150,12 +150,34 @@ function canvasContext(width, height) {
   return { canvas, context }
 }
 
-async function renderPage(page, viewport, maxSize) {
+async function untilAborted(promise, signal) {
+  if (!signal) return promise
+  let abort
+  const cancelled = new Promise((_, reject) => {
+    abort = () => reject(signal.reason)
+    if (signal.aborted) abort()
+    else signal.addEventListener('abort', abort, { once: true })
+  })
+  try {
+    return await Promise.race([promise, cancelled])
+  } finally {
+    signal.removeEventListener('abort', abort)
+  }
+}
+
+async function renderPage(page, viewport, maxSize, signal) {
   const scale = Math.min(4, maxSize / Math.max(viewport.width, viewport.height))
   const larger = page.getViewport({ scale })
   const { canvas } = canvasContext(larger.width, larger.height)
-  await page.render({ canvas, viewport: larger, recordImages: true, annotationMode: AnnotationMode.DISABLE }).promise
-  return canvas
+  const task = page.render({ canvas, viewport: larger, recordImages: true, annotationMode: AnnotationMode.DISABLE })
+  try {
+    await untilAborted(task.promise, signal)
+    return canvas
+  } catch (error) {
+    if (signal?.aborted) task.cancel()
+    canvas.width = canvas.height = 1
+    throw error
+  }
 }
 
 function pageImages(coordinates = []) {
@@ -314,7 +336,7 @@ function findIllustrations({ width, height, pixels }, paragraphs, existingImages
   return illustrations
 }
 
-async function startOcr(language, logger) {
+async function startOcr(language, logger, signal) {
   let rejectStartup
   const startupError = new Promise((_, reject) => { rejectStartup = reject })
   const workerPromise = createWorker(language, OEM.LSTM_ONLY, {
@@ -327,14 +349,9 @@ async function startOcr(language, logger) {
   })
   const timeout = setTimeout(() => rejectStartup(new Error('Tempo limite do OCR.')), 45_000)
   try {
-    const worker = await Promise.race([workerPromise, startupError])
-    try {
-      await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO, user_defined_dpi: '220' })
-      return worker
-    } catch (error) {
-      await worker.terminate()
-      throw error
-    }
+    const worker = await untilAborted(Promise.race([workerPromise, startupError]), signal)
+    await untilAborted(worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO, user_defined_dpi: '220' }), signal)
+    return worker
   } catch (error) {
     workerPromise.then(worker => worker.terminate()).catch(() => {})
     throw error
@@ -343,13 +360,27 @@ async function startOcr(language, logger) {
   }
 }
 
-export async function importPdf(file, { language = 'por+eng', onProgress = () => {} } = {}) {
+function pageBytes(page) {
+  return new Blob([JSON.stringify(page)]).size
+}
+
+function checkContentSize(bytes) {
+  if (bytes > MAX_CONTENT_BYTES) throw new Error('O conteúdo extraído ficou muito grande. Divida o PDF em arquivos menores.')
+}
+
+export async function importPdf(file, {
+  language = 'por+eng', onProgress = () => {}, onPage = () => {}, resume, signal,
+} = {}) {
+  signal?.throwIfAborted()
   if (!file?.size || file.size > MAX_PDF_BYTES) throw new Error('Escolha um PDF de até 80 MB.')
   if (!/^(por|eng)(\+(por|eng))?$/.test(language)) throw new Error('Idioma de OCR inválido.')
 
   onProgress({ stage: 'opening', current: 0, total: 0 })
+  signal?.throwIfAborted()
+  const buffer = await untilAborted(file.arrayBuffer(), signal)
+  signal?.throwIfAborted()
   const loading = getDocument({
-    data: new Uint8Array(await file.arrayBuffer()),
+    data: new Uint8Array(buffer),
     cMapUrl: new URL('pdf/cmaps/', appAssets).href,
     iccUrl: new URL('pdf/iccs/', appAssets).href,
     standardFontDataUrl: new URL('pdf/standard_fonts/', appAssets).href,
@@ -362,29 +393,42 @@ export async function importPdf(file, { language = 'por+eng', onProgress = () =>
   let ocrUnavailable = false
   let current = 0
   let total = 0
-  let thumbnail = null
-  let contentSize = 0
-  const fallbackPages = []
-  const pages = []
+  let thumbnail = resume?.thumbnail ?? null
   try {
-    const pdf = await loading.promise
+    const pdf = await untilAborted(loading.promise, signal)
+    signal?.throwIfAborted()
     total = pdf.numPages
     if (total > MAX_PAGES) throw new Error(`O PDF pode ter até ${MAX_PAGES} páginas.`)
-    const meta = await pdf.getMetadata().catch(() => null)
+    const pages = [...(resume?.pages ?? [])]
+    if (pages.length > total || pages.some(page => !Array.isArray(page?.blocks))) {
+      throw new Error('Não foi possível retomar as páginas salvas deste PDF.')
+    }
+    const fallbackPages = [...(resume?.fallbackPages ?? [])]
+    let contentSize = pages.reduce((size, page) => size + pageBytes(page), 0)
+    checkContentSize(contentSize)
+    const meta = await untilAborted(pdf.getMetadata().catch(() => null), signal)
+    signal?.throwIfAborted()
     const rawTitle = [meta?.info?.Title, file.name?.replace(/\.pdf$/i, '')]
       .find(value => typeof value === 'string' && normalizedText(value))
     const title = normalizedText(rawTitle ?? 'PDF sem título').slice(0, 180)
 
-    for (current = 1; current <= total; current++) {
+    for (current = pages.length + 1; current <= total; current++) {
       onProgress({ stage: 'extracting', current, total })
-      const page = await pdf.getPage(current)
+      signal?.throwIfAborted()
+      const page = await untilAborted(pdf.getPage(current), signal)
       let canvas
+      let result
+      let fallback = false
       try {
+        signal?.throwIfAborted()
         const viewport = page.getViewport({ scale: 1 })
-        const lines = textLines(await page.getTextContent(), viewport)
+        const content = await untilAborted(page.getTextContent(), signal)
+        signal?.throwIfAborted()
+        const lines = textLines(content, viewport)
         let paragraphs = digitalParagraphs(lines, viewport)
         const native = inspectText(paragraphs)
-        canvas = await renderPage(page, viewport, native.suspect || native.characters < 70 ? 1900 : 1350)
+        canvas = await renderPage(page, viewport, native.suspect || native.characters < 70 ? 1900 : 1350, signal)
+        signal?.throwIfAborted()
         if (current === 1) thumbnail = imageData(canvas, wholePage, 280)
         let images = pageImages(page.imageCoordinates ?? [])
         const scanImage = images.some(image => area(image) > 0.65)
@@ -397,11 +441,17 @@ export async function importPdf(file, { language = 'por+eng', onProgress = () =>
           }
           if (hasContent && !ocrUnavailable) {
             onProgress({ stage: 'ocr', current, total })
+            signal?.throwIfAborted()
             try {
               ocrWorker ??= await startOcr(language, ({ progress, status }) => {
-                if (status === 'recognizing text') onProgress({ stage: 'ocr', current, total, fraction: progress })
-              })
-              const { data } = await ocrWorker.recognize(canvas, {}, { blocks: true, text: true })
+                if (status === 'recognizing text' && !signal?.aborted) {
+                  onProgress({ stage: 'ocr', current, total, fraction: progress })
+                }
+              }, signal)
+              signal?.throwIfAborted()
+              const recognition = ocrWorker.recognize(canvas, {}, { blocks: true, text: true })
+              const { data } = await untilAborted(recognition, signal)
+              signal?.throwIfAborted()
               const recognized = ocrParagraphs(data, canvas)
               if (ocrRecovered(data, recognized, native)) {
                 paragraphs = recognized
@@ -410,12 +460,13 @@ export async function importPdf(file, { language = 'por+eng', onProgress = () =>
                 images.push(...findIllustrations(sample, paragraphs, images))
               }
             } catch {
+              signal?.throwIfAborted()
               // The source page stays readable if the browser cannot start its OCR worker.
               ocrUnavailable = true
             }
           }
           if (!paragraphs.length && hasContent && (native.suspect || !images.length)) images = [wholePage]
-          if (!paragraphs.length && images.length) fallbackPages.push(current)
+          fallback = !paragraphs.length && images.length > 0
         } else {
           // Searchable scans already carry a text layer. Keep their text and recover figures.
           if (scanImage && lines.length > 4) images = images.filter(image => area(image) <= 0.65)
@@ -426,24 +477,32 @@ export async function importPdf(file, { language = 'por+eng', onProgress = () =>
           images.push(...findIllustrations(sampledPage(canvas), textBounds, images))
         }
 
-        const blocks = blocksForPage(paragraphs, images, canvas, current, fallbackPages.at(-1) === current)
-        const result = { blocks }
-        contentSize += new Blob([JSON.stringify(result)]).size
-        if (contentSize > MAX_CONTENT_BYTES) throw new Error('O conteúdo extraído ficou muito grande. Divida o PDF em arquivos menores.')
-        pages.push(result)
+        const blocks = blocksForPage(paragraphs, images, canvas, current, fallback)
+        result = { blocks }
+        contentSize += pageBytes(result)
+        checkContentSize(contentSize)
       } finally {
         page.cleanup()
         if (canvas) canvas.width = canvas.height = 1
       }
+      signal?.throwIfAborted()
+      // Let a started checkpoint finish before an aborted caller releases its job lock.
+      await onPage({ index: current - 1, page: result, thumbnail: current === 1 ? thumbnail : null, fallback })
+      signal?.throwIfAborted()
+      pages.push(result)
+      if (fallback) fallbackPages.push(current)
     }
     if (!pages.some(page => page.blocks.length)) throw new Error('O PDF não contém texto ou imagens legíveis.')
     onProgress({ stage: 'complete', current: total, total })
+    signal?.throwIfAborted()
     return { title, pages, thumbnail, fallbackPages }
   } catch (error) {
+    signal?.throwIfAborted()
     if (error.name === 'PasswordException') throw new Error('Remova a senha do PDF antes de enviar o arquivo.')
     if (error.name === 'InvalidPDFException') throw new Error('O arquivo está corrompido ou não é um PDF válido.')
     throw error
   } finally {
     await Promise.allSettled([loading.destroy(), ocrWorker?.terminate()])
+    signal?.throwIfAborted()
   }
 }

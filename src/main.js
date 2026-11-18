@@ -1,4 +1,5 @@
 import './style.css'
+import { createImportManager } from './import-jobs.js'
 import { sampleBooks } from './samples.js'
 
 const app = document.querySelector('#app')
@@ -17,6 +18,7 @@ const icons = {
   file: '<path d="M13 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10z"/><path d="M13 3v7h7M8 14h8m-8 3h6"/>',
   chevron: '<path d="m9 18 6-6-6-6"/>',
   external: '<path d="M13 5h6v6m0-6-9 9"/><path d="M19 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/>',
+  trash: '<path d="M4 7h16m-14 0 1 13h10l1-13M9 7V4h6v3m-5 3v6m4-6v6"/>',
 }
 const icon = name => `<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${icons[name]}</svg>`
 const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({
@@ -33,6 +35,11 @@ let readerCleanup
 let readerBook
 let readerRequest = 0
 let toastTimeout
+const imports = createImportManager({
+  uploadBook,
+  onChange: updateImportProgress,
+  onComplete: finishUpload,
+})
 
 function announce(message) {
   toast.textContent = message
@@ -41,14 +48,19 @@ function announce(message) {
   toastTimeout = window.setTimeout(() => { toast.hidden = true }, 4200)
 }
 
-async function api(path, { method = 'GET', data } = {}) {
+async function api(path, { method = 'GET', data, signal } = {}) {
   const response = await fetch(`/api${path}`, {
     method,
+    signal,
     headers: data === undefined ? {} : { 'Content-Type': 'application/json' },
     body: data === undefined ? undefined : JSON.stringify(data),
   })
   const body = await response.json().catch(() => null)
-  if (!response.ok || !body) throw new Error(body?.error || 'A biblioteca está indisponível. Tente novamente.')
+  if (!response.ok || !body) {
+    const error = new Error(body?.error || 'A biblioteca está indisponível. Tente novamente.')
+    error.status = response.status
+    throw error
+  }
   return body
 }
 
@@ -81,7 +93,8 @@ async function transferParts(count, transfer, onProgress = () => {}) {
   return results
 }
 
-async function uploadBook(document, onProgress) {
+async function uploadBook(document, onProgress, { id, accountId, signal }) {
+  signal.throwIfAborted()
   const serialized = JSON.stringify(document)
   const parts = []
   for (let start = 0; start < serialized.length;) {
@@ -91,17 +104,16 @@ async function uploadBook(document, onProgress) {
     parts.push(serialized.slice(start, end))
     start = end
   }
-  const { id } = await api('/imports', { method: 'POST', data: { partCount: parts.length } })
+  const session = await api('/imports', { method: 'POST', data: { id, accountId, partCount: parts.length }, signal })
+  if (session.book) return session.book
+  const received = new Set(session.receivedParts)
+  const remaining = parts.map((_, index) => index).filter(index => !received.has(index))
   const path = `/imports/${id}`
-  try {
-    await transferParts(parts.length, part => api(`${path}/${part}`, {
-      method: 'PUT', data: { chunk: parts[part] },
-    }), onProgress)
-    return (await api(`${path}/complete`, { method: 'POST' })).book
-  } catch (error) {
-    await api(path, { method: 'DELETE' }).catch(() => {})
-    throw error
-  }
+  onProgress(received.size, parts.length)
+  await transferParts(remaining.length, offset => api(`${path}/${remaining[offset]}`, {
+    method: 'PUT', data: { chunk: parts[remaining[offset]] }, signal,
+  }), sent => onProgress(received.size + sent, parts.length))
+  return (await api(`${path}/complete`, { method: 'POST', signal })).book
 }
 
 async function loadBook(id) {
@@ -143,7 +155,8 @@ function bookCard(book) {
   const cover = imported && book.thumbnail
     ? `<img src="${escape(book.thumbnail)}" alt="" loading="lazy">`
     : `<div class="cover-text"><span>${escape(book.author || 'Documento pessoal')}</span><strong>${escape(book.title)}</strong></div>`
-  return `<button class="book-card" type="button" data-book="${escape(book.id)}">
+  return `<div class="book-tile${imported ? ' book-tile-owned' : ''}">
+  <button class="book-card" type="button" data-book="${escape(book.id)}">
     <div class="book-cover ${imported ? 'cover-imported' : `cover-${book.id}`}">${cover}</div>
     <div class="book-caption">
       <h3>${escape(book.title)}</h3>
@@ -151,7 +164,9 @@ function bookCard(book) {
       <span class="book-genre">${escape(book.genre ?? `${book.pageCount} páginas`)}</span>
     </div>
     ${book.currentPage > 0 ? `<span class="book-progress" aria-label="Página ${book.currentPage + 1} de ${book.pageCount}"><span style="width: ${(book.currentPage + 1) / book.pageCount * 100}%"></span></span>` : ''}
-  </button>`
+  </button>
+  ${imported ? `<button class="book-delete" type="button" data-delete-book="${escape(book.id)}" aria-label="Apagar ${escape(book.title)}" title="Apagar livro">${icon('trash')}</button>` : ''}
+  </div>`
 }
 
 function libraryView() {
@@ -257,17 +272,25 @@ function renderShell() {
     <main class="main-area">
       <header class="topbar"><p>${icon(section === 'library' ? 'library' : 'bookmark')} ${section === 'library' ? 'Biblioteca' : 'Destaques'}</p>
         <button class="button topbar-upload" type="button" data-action="upload">${icon('upload')} Importar PDF</button></header>
+      <div id="import-summary" class="import-summary" hidden>
+        <button type="button" class="import-summary-button" data-action="upload" aria-haspopup="dialog">
+          <span class="import-summary-text"><strong data-import-state></strong><span data-import-title></span></span>
+          <progress max="100" value="0" aria-hidden="true"></progress><strong class="import-summary-percent" data-import-percent></strong>
+        </button>
+      </div>
       ${section === 'library' ? libraryView() : `<div class="page-content highlights-page">
         <div class="page-intro"><h1>Seus destaques</h1><p>Volte aos trechos que você marcou.</p></div>
         <div id="highlight-results" aria-live="polite"><p>Carregando destaques…</p></div>
       </div>`}
     </main>
   </div>`
+  updateImportProgress(imports.current)
   if (section === 'library') renderBookList()
   if (section === 'highlights') void renderHighlights()
 }
 
-function showDialog(title, contents) {
+function showDialog(title, contents, view = '') {
+  dialog.dataset.view = view
   dialog.innerHTML = `<div class="modal-header"><h2 id="dialog-title">${escape(title)}</h2>
     <button type="button" class="icon-button" data-action="close-dialog" aria-label="Fechar">${icon('close')}</button></div>${contents}`
   if (!dialog.open) dialog.showModal()
@@ -300,6 +323,7 @@ function showAuth(mode = 'login', after) {
       const data = Object.fromEntries(new FormData(form))
       user = (await api(register ? '/register' : '/login', { method: 'POST', data })).user
       try { await refreshBooks() } catch (failure) { announce(failure.message) }
+      await setupImports()
       dialog.close()
       renderShell()
       after?.()
@@ -318,15 +342,69 @@ function showAccount() {
     <button class="button secondary" type="button" data-action="logout">Sair da conta</button>`)
 }
 
+function updateImportProgress(job) {
+  const summary = document.querySelector('#import-summary')
+  if (summary) summary.hidden = !job
+  const watching = dialog.open && dialog.dataset.view === 'import-progress'
+  if (!job) {
+    if (watching) {
+      dialog.querySelector('[data-import-message]').textContent = 'Importação encerrada.'
+      dialog.querySelector('.import-meter').hidden = true
+      dialog.querySelector('[data-import-storage]').hidden = true
+      dialog.querySelector('[data-action="retry-import"]').hidden = true
+      dialog.querySelector('[data-action="discard-import"]').hidden = true
+    }
+    return
+  }
+
+  if (summary) {
+    const state = job.status === 'error' ? 'Importação pausada' : 'Importando PDF'
+    summary.querySelector('[data-import-state]').textContent = state
+    const title = summary.querySelector('[data-import-title]')
+    title.textContent = job.title
+    title.title = job.title
+    summary.querySelector('[data-import-percent]').textContent = `${job.percent}%`
+    summary.querySelector('progress').value = job.percent
+  }
+
+  if (!watching || dialog.dataset.importId !== job.id) return
+  dialog.querySelector('.import-job-title').textContent = job.title
+  dialog.querySelector('.import-meter progress').value = job.percent
+  dialog.querySelector('.import-meter strong').textContent = `${job.percent}%`
+  const message = dialog.querySelector('[data-import-message]')
+  const nextMessage = job.status === 'error' ? job.error : job.phase || 'Preparando a importação…'
+  if (message.textContent !== nextMessage) message.textContent = nextMessage
+  dialog.querySelector('[data-import-storage]').hidden = job.persistent !== false
+  dialog.querySelector('[data-action="retry-import"]').hidden = job.status !== 'error'
+  dialog.querySelector('[data-action="discard-import"]').hidden = job.status !== 'error'
+}
+
+function showImportProgress() {
+  showDialog('Importação de PDF', `
+    <div class="import-job">
+      <p class="import-job-title"></p>
+      <div class="import-meter"><progress max="100" value="0" aria-label="Progresso da importação"></progress><strong></strong></div>
+      <p class="modal-description" data-import-message aria-live="polite"></p>
+      <p class="field-hint" data-import-storage hidden>O navegador não conseguiu salvar o progresso. Mantenha esta aba aberta até terminar.</p>
+      <div class="modal-actions">
+        <button class="button secondary" type="button" data-action="close-dialog">Continuar navegando</button>
+        <button class="button secondary" type="button" data-action="discard-import" hidden>Descartar</button>
+        <button class="button primary" type="button" data-action="retry-import" hidden>Tentar novamente</button>
+      </div>
+    </div>`, 'import-progress')
+  dialog.dataset.importId = imports.current.id
+  updateImportProgress(imports.current)
+}
+
 function showUpload() {
   if (!user) return showAuth('login', showUpload)
+  if (imports.current) return showImportProgress()
   showDialog('Importar PDF', `
     <p class="modal-description">O texto será extraído para o leitor. Para páginas escaneadas ou com caracteres ilegíveis, o app tenta reconhecer o texto em português e inglês.</p>
     <form id="upload-form" class="modal-form">
       <label class="file-drop">${icon('upload')}<strong>Escolha um arquivo PDF</strong><small>Até 80 MB e 500 páginas</small><input type="file" name="file" accept=".pdf,application/pdf" required></label>
       <label>Título opcional<input name="title" maxlength="240" placeholder="Usar o título do PDF"></label>
       <p class="form-error" role="alert" hidden></p>
-      <div class="upload-status" hidden><progress></progress><p aria-live="polite"></p></div>
       <button class="button primary full-width" type="submit">${icon('upload')} Importar e preparar leitura</button>
     </form>`)
   dialog.querySelector('#upload-form').onsubmit = async event => {
@@ -335,61 +413,102 @@ function showUpload() {
     const { file, title } = Object.fromEntries(new FormData(form))
     const submit = form.querySelector('[type=submit]')
     const error = form.querySelector('.form-error')
-    const status = form.querySelector('.upload-status')
-    const progress = status.querySelector('progress')
-    const report = status.querySelector('p')
     submit.disabled = true
     error.hidden = true
-    status.hidden = false
-    progress.removeAttribute('value')
-    report.textContent = 'Abrindo o PDF…'
-    dialog.dataset.busy = 'true'
-    dialog.querySelector('[data-action=close-dialog]').disabled = true
     try {
-      const { importPdf } = await import('./pdf.js')
-      const { title: extractedTitle, pages, thumbnail, fallbackPages } = await importPdf(file, {
-        onProgress: ({ stage, current, total, fraction = 0 }) => {
-          if (!total) return
-          progress.max = total
-          progress.value = stage === 'complete' ? total : Math.max(0, current - 1 + fraction)
-          report.textContent = stage === 'ocr'
-            ? `Reconhecendo texto da página ${current} de ${total}…`
-            : `Processando página ${current} de ${total}…`
-        },
-      })
-      report.textContent = 'Salvando na sua biblioteca…'
-      progress.removeAttribute('value')
-      const book = await uploadBook({ title: title.trim() || extractedTitle, pages, thumbnail },
-        (current, total) => {
-          report.textContent = current === total ? 'Concluindo a importação…' : 'Salvando na sua biblioteca…'
-          progress.max = total
-          progress.value = current
-        })
-      books = [book, ...books]
-      section = 'library'
-      filter = 'all'
-      query = ''
-      dialog.close()
-      const count = fallbackPages.length
-      announce(count
-        ? `PDF adicionado. ${count === 1 ? 'Uma página foi preservada como imagem.' : `${count} páginas foram preservadas como imagens.`}`
-        : 'PDF adicionado à biblioteca.')
-      await openBook(book.id)
+      await imports.start(file, title.trim())
+      if (dialog.open && dialog.contains(form) && imports.current) showImportProgress()
     } catch (failure) {
-      error.hidden = false
-      error.textContent = failure.message
+      if (form.isConnected && dialog.open) {
+        error.hidden = false
+        error.textContent = failure.message
+      } else {
+        announce(failure.message)
+      }
     } finally {
-      delete dialog.dataset.busy
-      const close = dialog.querySelector('[data-action=close-dialog]')
-      if (close) close.disabled = false
-      status.hidden = true
+      submit.disabled = false
+    }
+  }
+}
+
+async function setupImports() {
+  try {
+    await imports.setAccount(user?.id ?? null)
+  } catch (error) {
+    announce(error.message)
+  }
+}
+
+async function finishUpload({ id, book, fallbackPages }, accountId) {
+  if (user?.id !== accountId) return
+  if (book) {
+    books = [book, ...books.filter(item => item.id !== book.id)]
+  } else {
+    try { await refreshBooks() } catch (error) { return announce(error.message) }
+  }
+  if (user?.id !== accountId) return
+  renderBookList()
+  const count = fallbackPages?.length ?? 0
+  const message = count
+    ? `PDF adicionado. ${count === 1 ? 'Uma página foi preservada como imagem.' : `${count} páginas foram preservadas como imagens.`}`
+    : 'PDF adicionado à biblioteca.'
+  if (dialog.open && dialog.dataset.view === 'import-progress' && dialog.dataset.importId === (id ?? book?.id)) {
+    showDialog('Importação concluída', `
+      <p class="modal-description">${escape(message)}</p>
+      <div class="modal-actions">
+        <button class="button secondary" type="button" data-action="close-dialog">Fechar</button>
+        ${book ? `<button class="button primary" type="button" data-action="read-import" data-book="${escape(book.id)}">Ler agora</button>` : ''}
+      </div>`)
+  } else {
+    announce(message)
+  }
+}
+
+function showDeleteBook(id) {
+  const book = books.find(item => item.id === id)
+  if (!user || !book) return
+  readerRequest++
+  showDialog('Apagar livro?', `
+    <p class="modal-description"><strong>${escape(book.title)}</strong> será removido da sua biblioteca, junto com o progresso e os destaques dele.</p>
+    <form id="delete-book-form" class="modal-form">
+      <p class="form-error" role="alert" hidden></p>
+      <div class="modal-actions">
+        <button class="button secondary" type="button" data-action="close-dialog" autofocus>Cancelar</button>
+        <button class="button danger" type="submit">${icon('trash')} Apagar livro</button>
+      </div>
+    </form>`)
+  dialog.querySelector('#delete-book-form').onsubmit = async event => {
+    event.preventDefault()
+    const form = event.currentTarget
+    const submit = form.querySelector('[type=submit]')
+    const error = form.querySelector('.form-error')
+    submit.disabled = true
+    error.hidden = true
+    try {
+      await api(`/books/${id}`, { method: 'DELETE' }).catch(failure => {
+        if (failure.status !== 404) throw failure
+      })
+      books = books.filter(item => item.id !== id)
+      if (dialog.open && dialog.contains(form)) dialog.close()
+      renderBookList()
+      announce('Livro apagado da biblioteca.')
+    } catch (failure) {
+      if (dialog.open && dialog.contains(form)) {
+        error.hidden = false
+        error.textContent = failure.message
+      } else {
+        announce(failure.message)
+      }
+    } finally {
       submit.disabled = false
     }
   }
 }
 
 async function refreshBooks() {
-  books = user ? await listAll('/books', 'books') : []
+  const account = user?.id
+  const result = account ? await listAll('/books', 'books') : []
+  if (account === user?.id) books = result
 }
 
 async function openBook(id, explicitPage) {
@@ -458,9 +577,10 @@ async function openBook(id, explicitPage) {
 app.addEventListener('click', event => {
   const button = event.target.closest('button')
   if (!button) return
-  const { action, section: targetSection, book, page, filter: targetFilter } = button.dataset
+  const { action, section: targetSection, book, deleteBook, page, filter: targetFilter } = button.dataset
   if (action === 'upload') showUpload()
   if (action === 'account') showAccount()
+  if (deleteBook) showDeleteBook(deleteBook)
   if (book) void openBook(book, page === undefined ? undefined : Number(page))
   if (targetSection) {
     readerRequest++
@@ -480,30 +600,58 @@ app.addEventListener('input', event => {
   renderBookList()
 })
 
-dialog.addEventListener('cancel', event => {
-  if (dialog.dataset.busy) event.preventDefault()
-})
-
 dialog.addEventListener('click', async event => {
-  const action = event.target.closest('button')?.dataset.action
-  if (!dialog.dataset.busy && (event.target === dialog || action === 'close-dialog')) dialog.close()
+  const button = event.target.closest('button')
+  const action = button?.dataset.action
+  if (event.target === dialog || action === 'close-dialog') dialog.close()
+  if (action === 'read-import') {
+    dialog.close()
+    void openBook(button.dataset.book)
+  }
+  if (action === 'retry-import' || action === 'discard-import') {
+    button.disabled = true
+    try {
+      if (action === 'retry-import') {
+        await imports.retry()
+      } else {
+        const id = imports.current?.id
+        await imports.discard()
+        if (id) await api(`/imports/${id}`, { method: 'DELETE' }).catch(() => {})
+        if (dialog.open && dialog.contains(button)) dialog.close()
+      }
+    } catch (error) {
+      if (dialog.open && dialog.contains(button)) {
+        dialog.querySelector('[data-import-message]').textContent = error.message
+      } else {
+        announce(error.message)
+      }
+    } finally {
+      button.disabled = false
+    }
+  }
   if (action !== 'logout') return
+  button.disabled = true
   try {
+    await imports.setAccount(null)
     await api('/logout', { method: 'POST' })
     user = null
     books = []
     dialog.close()
     renderShell()
   } catch (error) {
+    void setupImports()
     announce(error.message)
+  } finally {
+    button.disabled = false
   }
 })
 
 renderShell()
 try {
   user = (await api('/session')).user
-  await refreshBooks()
+  try { await refreshBooks() } catch (error) { announce(error.message) }
   if (user && !readerBook) renderShell()
+  await setupImports()
 } catch (error) {
   announce(error.message)
 }

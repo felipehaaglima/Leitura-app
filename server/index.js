@@ -25,6 +25,8 @@ const maxPartBytes = 3_100_000;
 const maxHostedJsonBytes = 4_000_000;
 const maxImportParts = Math.ceil(maxBookBytes / (chunkSize - 1));
 const importDuration = 2 * 60 * 60 * 1000;
+const importIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const deletedImport = 2;
 const bookBatchSize = 6;
 const highlightBatchSize = 48;
 const scryptAsync = promisify(scrypt);
@@ -85,7 +87,6 @@ const queries = {
   getBookSummary: prepare(bookSummarySql),
   getBookMetadata: prepare(`SELECT ${summaryFields}, length(pages_json) AS "dataLength" FROM books WHERE id = ? AND owner_id = ?`),
   getBookChunk: prepare('SELECT substr(pages_json, ?, ?) AS chunk FROM books WHERE id = ? AND owner_id = ?'),
-  deleteBook: prepare('DELETE FROM books WHERE id = ? AND owner_id = ?'),
   updateProgress: prepare(`
     UPDATE books SET current_page = ?, updated_at = ?
     WHERE id = ? AND owner_id = ? AND page_count > ?
@@ -382,31 +383,67 @@ function importNotFound() {
   return new HttpError(404, 'Importação não encontrada ou expirada.');
 }
 
+function importConflict() {
+  return new HttpError(409, 'Não foi possível usar este identificador de importação.');
+}
+
 async function startImport(request, response, userId) {
-  const { partCount } = await readJson(request);
+  const { id: clientId, partCount, accountId } = await readJson(request);
+  if (accountId !== undefined && accountId !== userId) {
+    throw new HttpError(403, 'Entre novamente na conta que iniciou esta importação.');
+  }
   if (!Number.isSafeInteger(partCount) || partCount < 1 || partCount > maxImportParts) {
     throw new HttpError(400, 'Quantidade de partes inválida.');
   }
+  if (clientId !== undefined && (typeof clientId !== 'string' || !importIdPattern.test(clientId))) {
+    throw new HttpError(400, 'Identificador de importação inválido.');
+  }
 
-  const id = randomUUID();
-  const now = Date.now();
-  await storage.transaction(async (connection) => {
-    await connection.run('DELETE FROM imports WHERE expires_at <= ?', now);
-    await connection.get(`SELECT id FROM users WHERE id = ?${storage.forUpdate}`, userId);
+  const id = clientId?.toLowerCase() ?? randomUUID();
+  await storage.run('DELETE FROM imports WHERE expires_at <= ? AND completed <> ?', Date.now(), deletedImport);
+  const { status, body } = await storage.transaction(async (connection) => {
+    // Serialize starts for one account without blocking the book insert's foreign-key check.
+    const userLock = storage.postgres ? ' FOR NO KEY UPDATE' : '';
+    await connection.get(`SELECT id FROM users WHERE id = ?${userLock}`, userId);
+    const item = await lockImport(connection, id, userId);
+    const now = Date.now();
+
+    if (item?.completed === deletedImport) throw notFound();
+    if (item && item.expires_at > now && !item.completed) {
+      if (item.part_count !== partCount) throw new HttpError(409, 'A quantidade de partes desta importação mudou.');
+      const parts = await connection.all(
+        'SELECT part_number FROM import_parts WHERE import_id = ? ORDER BY part_number', id,
+      );
+      await connection.run('UPDATE imports SET expires_at = ? WHERE id = ?', now + importDuration, id);
+      return { status: 200, body: { id, receivedParts: parts.map(({ part_number }) => part_number) } };
+    }
+
+    const book = await connection.get(bookSummarySql, id, userId);
+    if (book) return { status: 200, body: { id, book, receivedParts: [] } };
+    if (item && item.expires_at > now) throw notFound();
+    if (await connection.get('SELECT id FROM books WHERE id = ?', id)) throw importConflict();
+
+    await connection.run('DELETE FROM imports WHERE id = ? AND expires_at <= ? AND completed <> ?', id, now, deletedImport);
     const { count } = await connection.get(
-      'SELECT CAST(count(*) AS INTEGER) AS count FROM imports WHERE owner_id = ? AND completed = 0', userId,
+      `SELECT CAST(count(*) AS INTEGER) AS count
+       FROM imports WHERE owner_id = ? AND completed = 0 AND expires_at > ?`, userId, now,
     );
     if (count >= 4) throw new HttpError(429, 'Há muitas importações em andamento. Conclua ou cancele uma delas.');
-    await connection.run('INSERT INTO imports (id, owner_id, part_count, expires_at) VALUES (?, ?, ?, ?)',
-      id, userId, partCount, now + importDuration);
+    const created = await connection.run(
+      `INSERT INTO imports (id, owner_id, part_count, expires_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT (id) DO NOTHING`,
+      id, userId, partCount, now + importDuration,
+    );
+    if (!created.changes) throw importConflict();
+    return { status: 201, body: { id, receivedParts: [] } };
   });
-  respondJson(response, 201, { id });
+  respondJson(response, status, body);
 }
 
-function getImport(connection, importId, userId) {
+function lockImport(connection, importId, userId) {
   return connection.get(
-    `SELECT part_count, completed FROM imports WHERE id = ? AND owner_id = ? AND expires_at > ?${storage.forUpdate}`,
-    importId, userId, Date.now(),
+    `SELECT part_count, completed, expires_at FROM imports WHERE id = ? AND owner_id = ?${storage.forUpdate}`,
+    importId, userId,
   );
 }
 
@@ -417,8 +454,8 @@ async function putImportPart(request, response, importId, userId, partNumber) {
   }
 
   await storage.transaction(async (connection) => {
-    const item = await getImport(connection, importId, userId);
-    if (!item) throw importNotFound();
+    const item = await lockImport(connection, importId, userId);
+    if (!item || item.completed === deletedImport || item.expires_at <= Date.now()) throw importNotFound();
     if (item.completed) throw new HttpError(409, 'Esta importação já foi concluída.');
     if (partNumber >= item.part_count) throw new HttpError(400, 'Número de parte inválido.');
 
@@ -441,12 +478,13 @@ async function putImportPart(request, response, importId, userId, partNumber) {
 
 async function completeImport(response, importId, userId) {
   const book = await storage.transaction(async (connection) => {
-    const item = await getImport(connection, importId, userId);
-    if (!item) throw importNotFound();
-    if (item.completed) {
+    const item = await lockImport(connection, importId, userId);
+    if (item?.completed === deletedImport) throw notFound();
+    if (!item || item.completed || item.expires_at <= Date.now()) {
       const existing = await connection.get(bookSummarySql, importId, userId);
-      if (!existing) throw notFound();
-      return existing;
+      if (existing) return existing;
+      if (item?.completed) throw notFound();
+      throw importNotFound();
     }
 
     const parts = await connection.all('SELECT chunk FROM import_parts WHERE import_id = ? ORDER BY part_number', importId);
@@ -454,11 +492,29 @@ async function completeImport(response, importId, userId) {
 
     const body = parseJson(parts.map(({ chunk }) => chunk).join(''));
     const saved = await saveBook(connection, importId, userId, body);
-    await connection.run('UPDATE imports SET completed = 1 WHERE id = ?', importId);
+    await connection.run('UPDATE imports SET completed = 1, expires_at = ? WHERE id = ?', Date.now() + importDuration, importId);
     await connection.run('DELETE FROM import_parts WHERE import_id = ?', importId);
     return saved;
   });
   respondJson(response, 201, { book });
+}
+
+async function deleteBook(response, bookId, userId) {
+  await storage.transaction(async (connection) => {
+    await lockImport(connection, bookId, userId);
+    const deleted = await connection.run('DELETE FROM books WHERE id = ? AND owner_id = ?', bookId, userId);
+    if (!deleted.changes) throw notFound();
+
+    // An old client job can outlive the upload receipt and must not restore a deleted book.
+    const marker = await connection.run(`
+      INSERT INTO imports (id, owner_id, part_count, expires_at, completed) VALUES (?, ?, 0, ?, ?)
+      ON CONFLICT (id) DO UPDATE SET part_count = 0, expires_at = excluded.expires_at, completed = excluded.completed
+      WHERE imports.owner_id = excluded.owner_id
+    `, bookId, userId, Number.MAX_SAFE_INTEGER, deletedImport);
+    if (!marker.changes) throw importConflict();
+    await connection.run('DELETE FROM import_parts WHERE import_id = ?', bookId);
+  });
+  respondJson(response, 200, { ok: true });
 }
 
 function numericParam(value, message, max = 10_000_000) {
@@ -552,8 +608,7 @@ async function handleApi(request, response, pathname, searchParams, hosted) {
     });
   }
   if (!resource && method === 'DELETE') {
-    if ((await queries.deleteBook.run(bookId, user.id)).changes === 0) throw notFound();
-    return respondJson(response, 200, { ok: true });
+    return deleteBook(response, bookId, user.id);
   }
   if (resource === 'data' && !highlightId && method === 'GET') {
     const part = numericParam(searchParams.get('part'), 'Número de parte inválido.', maxImportParts - 1);

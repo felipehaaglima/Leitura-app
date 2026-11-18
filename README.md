@@ -11,7 +11,7 @@ npm ci
 npm run dev
 ```
 
-Abra o endereço que o Vite imprimir no terminal, normalmente `http://localhost:5173`. A API roda na porta 3001. Em **Importar PDF**, crie uma conta e escolha o arquivo. O livro processado abre automaticamente.
+Abra o endereço que o Vite imprimir no terminal, normalmente `http://localhost:5173`. A API roda na porta 3001. Em **Importar PDF**, crie uma conta e escolha o arquivo. O livro processado aparece na biblioteca.
 
 Para executar o build com um único servidor:
 
@@ -39,3 +39,5 @@ O servidor cria as tabelas na primeira operação que precisa do banco. Na Verce
 - O PDF é processado no navegador. O Tesseract reconhece texto em português e inglês em páginas digitalizadas ou com uma camada de texto ilegível. O arquivo original permanece no dispositivo e o servidor recebe o texto e as imagens preparados para o leitor. Para recuperar um livro afetado por caracteres ilegíveis em uma importação anterior, importe novamente o PDF original.
 - A importação aceita PDFs de até 80 MB e 500 páginas. A recuperação de texto e figuras depende da qualidade do escaneamento e do layout. Páginas em que o OCR não encontra texto legível podem aparecer como imagem.
 - PDFs importados, destaques e última página são salvos por conta. O progresso do acervo aberto e as preferências do leitor ficam no navegador.
+- A porcentagem da importação fica visível na biblioteca depois de fechar a janela de importação. Com a aba aberta, o processamento segue em segundo plano. Ao voltar no mesmo navegador após fechar a aba ou recarregar a página, a importação retoma a partir do progresso salvo. O arquivo usado na retomada fica temporariamente no navegador e é removido ao concluir ou descartar a importação.
+- Use a lixeira no cartão de um PDF para apagá-lo da biblioteca. A confirmação também remove o progresso e os destaques daquele livro.
