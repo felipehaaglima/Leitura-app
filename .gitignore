@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/
+.env
+.env.*
+!.env.example
+.DS_Store
+.vercel/
+/public/ocr/
+/public/pdf/

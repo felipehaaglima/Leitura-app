@@ -1,0 +1,8 @@
+.env
+.env.*
+.vercel/
+data/
+dist/
+node_modules/
+public/ocr/
+public/pdf/
