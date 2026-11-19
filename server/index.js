@@ -79,6 +79,9 @@ const getBlockSql = storage.postgres
      FROM books WHERE id = ? AND owner_id = ?${storage.forUpdate}`
   : `SELECT json_remove(json_extract(pages_json, ?), '$.src') AS block, page_count AS "pageCount"
      FROM books WHERE id = ? AND owner_id = ?`;
+const pageJsonSql = storage.postgres
+  ? '(pages_json::json -> (?::integer))::text'
+  : 'json_extract(pages_json, ?)';
 
 const queries = {
   userByEmail: prepare('SELECT * FROM users WHERE email = ?'),
@@ -95,6 +98,12 @@ const queries = {
   getBookSummary: prepare(bookSummarySql),
   getBookMetadata: prepare(`SELECT ${summaryFields}, length(pages_json) AS "dataLength" FROM books WHERE id = ? AND owner_id = ?`),
   getBookChunk: prepare('SELECT substr(pages_json, ?, ?) AS chunk FROM books WHERE id = ? AND owner_id = ?'),
+  getBookPageChunk: prepare(`
+    WITH book_page AS MATERIALIZED (
+      SELECT ${pageJsonSql} AS page_json FROM books WHERE id = ? AND owner_id = ?
+    )
+    SELECT substr(page_json, ?, ?) AS chunk, length(page_json) AS "dataLength" FROM book_page
+  `),
   getBookPageCount: prepare('SELECT page_count AS "pageCount" FROM books WHERE id = ? AND owner_id = ?'),
   deleteHighlight: prepare(`
     DELETE FROM highlights
@@ -566,6 +575,17 @@ function numericParam(value, message, max = 10_000_000) {
   return Number(value);
 }
 
+async function readBookPage(response, bookId, userId, searchParams) {
+  const page = numericParam(searchParams.get('page'), 'Página inválida.', 1_999);
+  const part = numericParam(searchParams.get('part') ?? '0', 'Número de parte inválido.', maxImportParts - 1);
+  const location = storage.postgres ? page : `$[${page}]`;
+  const row = await queries.getBookPageChunk.get(location, bookId, userId, part * chunkSize + 1, chunkSize);
+  if (!row) throw notFound();
+  if (row.dataLength === null) throw new HttpError(404, 'Página do livro não encontrada.');
+  if (!row.chunk) throw new HttpError(404, 'Parte da página não encontrada.');
+  return respondJson(response, 200, { chunk: row.chunk, partCount: Math.ceil(row.dataLength / chunkSize) });
+}
+
 async function listRows(sql, id, searchParams, limit, hosted) {
   const offset = searchParams.get('offset');
   if (offset === null && !hosted) return { rows: await storage.all(sql, id), nextOffset: null };
@@ -631,19 +651,20 @@ async function handleApi(request, response, pathname, searchParams, hosted) {
     }
   }
 
-  const match = /^\/api\/books\/([a-f0-9-]{36})(?:\/(progress|highlights|data)(?:\/([a-f0-9-]{36}))?)?$/.exec(pathname);
+  const match = /^\/api\/books\/([a-f0-9-]{36})(?:\/(progress|highlights|data|page)(?:\/([a-f0-9-]{36}))?)?$/.exec(pathname);
   if (!match) throw new HttpError(404, 'Recurso não encontrado.');
   const [, bookId, resource, highlightId] = match;
 
   if (!resource && method === 'GET') {
     if (searchParams.get('metadata') === '1') {
-      const row = await queries.getBookMetadata.get(bookId, user.id);
+      const paged = searchParams.get('paged') === '1';
+      const row = await (paged ? queries.getBookSummary : queries.getBookMetadata).get(bookId, user.id);
       if (!row) throw notFound();
       const { dataLength, ...summary } = row;
       const { rows, nextOffset } = await listRows(listHighlightsSql, bookId, new URLSearchParams({ offset: '0' }), highlightBatchSize, true);
-      const partCount = Math.ceil(dataLength / chunkSize);
+      const transfer = paged ? {} : { partCount: Math.ceil(dataLength / chunkSize) };
       return respondJson(response, 200, {
-        book: { ...formatBookSummary(summary), partCount, highlights: rows, nextHighlightOffset: nextOffset },
+        book: { ...formatBookSummary(summary), ...transfer, highlights: rows, nextHighlightOffset: nextOffset },
       });
     }
     const row = await queries.getBook.get(bookId, user.id);
@@ -662,6 +683,9 @@ async function handleApi(request, response, pathname, searchParams, hosted) {
     if (!row) throw notFound();
     if (!row.chunk) throw new HttpError(404, 'Parte do livro não encontrada.');
     return respondJson(response, 200, { chunk: row.chunk });
+  }
+  if (resource === 'page' && !highlightId && method === 'GET') {
+    return readBookPage(response, bookId, user.id, searchParams);
   }
   if (resource === 'progress' && !highlightId && method === 'PATCH') {
     return saveProgress(request, response, bookId, user.id);

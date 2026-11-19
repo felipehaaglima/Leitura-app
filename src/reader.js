@@ -120,21 +120,26 @@ function partSuffix(index) {
   return suffix;
 }
 
-export function renderReader(root, { book, onExit, onPosition, onAddHighlight, onRemoveHighlight }) {
+export function renderReader(root, { book, onExit, onPosition, onAddHighlight, onRemoveHighlight, loadPage }) {
   let pages = book.pages ?? [];
   let knownCount = book.pageCount;
   let loading = book.loading ?? null;
   const initialPage = Number.isInteger(book.position) && book.position >= 0 ? book.position : 0;
-  let page = pages[initialPage] ? initialPage : Math.max(0, pages.findIndex(Boolean));
+  let page = pages[initialPage] || (loadPage && initialPage < knownCount)
+    ? initialPage : Math.max(0, pages.findIndex(Boolean));
   let anchor = page === initialPage ? book.anchor : undefined;
   let parts = [[]];
   let part = 0;
   let displayed;
   let request = 0;
+  let pageLoad;
+  let retryPage;
   let layoutSize;
   let layoutController = new AbortController();
   const layouts = new Map();
   let highlights = [...(book.highlights ?? [])];
+  const removedHighlights = new Set();
+  let highlightRepaintPending = false;
   let positionUpdates = Promise.resolve();
   let preferences = readPreferences();
   let controlsOpen = false;
@@ -183,6 +188,10 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
         </div>
         <span class="lr-percent" aria-hidden="true"></span>
       </div>
+      <div class="lr-page-alert" hidden>
+        <span role="status"></span>
+        <button type="button" hidden>Tentar novamente</button>
+      </div>
       <span class="lr-status" role="status"></span>
     </footer>
     <section id="lr-appearance" class="lr-panel" data-panel="appearance" aria-labelledby="lr-appearance-title" hidden>
@@ -224,6 +233,9 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   const header = find(".lr-header");
   const counter = find(".lr-counter");
   const navigation = find(".lr-navigation");
+  const pageAlert = find(".lr-page-alert");
+  const pageMessage = pageAlert.querySelector("span");
+  const pageRetry = pageAlert.querySelector("button");
   const numberInput = find("#lr-page-number");
   const status = find(".lr-status");
   const progress = find("progress");
@@ -312,6 +324,13 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
     selectionMenu.hidden = true;
     colors.hidden = true;
     colorToggle.setAttribute("aria-expanded", "false");
+    if (highlightRepaintPending && !hasReadingSelection()) displayPage();
+  }
+
+  function hasReadingSelection() {
+    const selection = window.getSelection();
+    return Boolean(touchRange || (selection?.rangeCount && !selection.isCollapsed &&
+      (article.contains(selection.anchorNode) || article.contains(selection.focusNode))));
   }
 
   function clearSelection() {
@@ -324,6 +343,11 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   function pageTotal() {
     if (Number.isInteger(knownCount) && knownCount > 0) return knownCount;
     return loading ? null : pages.length;
+  }
+
+  function canOpen(index) {
+    const total = pageTotal();
+    return Number.isInteger(index) && index >= 0 && Boolean(pages[index] || (loadPage && total !== null && index < total));
   }
 
   function displayLoading() {
@@ -345,8 +369,8 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
     const total = pageTotal();
     const current = displayed ? page + 1 : 0;
     find(".lr-page-total").textContent = `de ${total ?? "…"}`;
-    find('[data-step="-1"]').disabled = !displayed || (part === 0 && !pages[page - 1]);
-    find('[data-step="1"]').disabled = !displayed || (part === parts.length - 1 && !pages[page + 1]);
+    find('[data-step="-1"]').disabled = !displayed || (part === 0 && !canOpen(page - 1));
+    find('[data-step="1"]').disabled = !displayed || (part === parts.length - 1 && !canOpen(page + 1));
     if (document.activeElement !== numberInput) numberInput.value = current;
     numberInput.disabled = !displayed;
     progress.max = Math.max(total ?? pages.length, 1);
@@ -357,6 +381,7 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   }
 
   function displayPage() {
+    highlightRepaintPending = false;
     const blocks = document.createDocumentFragment();
     const pageHighlights = highlights.filter((item) => item.page === page);
 
@@ -414,17 +439,52 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
     return pending.promise;
   }
 
+  function cancelPageLoad() {
+    const active = pageLoad;
+    pageLoad = null;
+    active?.controller.abort();
+  }
+
+  function requestPage(index) {
+    if (pageLoad?.index === index) return pageLoad.promise;
+    const controller = new AbortController();
+    const loader = loadPage;
+    const promise = Promise.resolve().then(() => loader(index, controller.signal)).then((source) => {
+      if (controller.signal.aborted) throw controller.signal.reason;
+      if (!Array.isArray(source?.blocks)) throw new Error("Página inválida.");
+      pages[index] = source;
+      return source;
+    }).finally(() => {
+      if (pageLoad?.controller === controller) pageLoad = null;
+    });
+    pageLoad = { index, controller, promise };
+    return promise;
+  }
+
+  function showPageAlert(message, retry = null) {
+    retryPage = retry;
+    pageAlert.hidden = !message;
+    pageMessage.textContent = message;
+    pageRetry.hidden = !retry;
+    if (message) status.textContent = "";
+  }
+
   async function goTo(index, destination, { last = false, persist = true } = {}) {
-    const source = pages[index];
-    if (!source) {
-      if (persist && index >= 0 && (pageTotal() === null || index < pageTotal())) {
+    if (!canOpen(index)) {
+      const total = pageTotal();
+      if (persist && index >= 0 && (total === null || index < total)) {
         announce(loading ? "Esta página ainda está sendo importada." : "Esta página está indisponível.");
       }
       return;
     }
     const ticket = ++request;
+    if (pageLoad && pageLoad.index !== index) cancelPageLoad();
+    const cached = pages[index];
+    showPageAlert(!cached || (!displayed && !loading) ? `Carregando página ${index + 1}…` : "");
     article.setAttribute("aria-busy", "true");
     try {
+      const source = cached ?? await requestPage(index);
+      if (ticket !== request || signal.aborted) return;
       const nextParts = await layoutFor(index, source);
       if (ticket !== request || signal.aborted) return;
       const nextPart = last ? nextParts.length - 1 : partAt(nextParts, destination);
@@ -432,6 +492,7 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
       const moved = page !== index || anchor?.block !== nextAnchor.block || anchor?.offset !== nextAnchor.offset;
 
       clearTimeout(tapTimer);
+      highlightRepaintPending = false;
       clearSelection();
       page = index;
       part = nextPart;
@@ -439,13 +500,16 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
       anchor = nextAnchor;
       displayed = source;
       displayPage();
+      showPageAlert("");
       if (persist && moved) {
         positionUpdates = positionUpdates
           .then(() => onPosition(index, nextAnchor))
           .catch(() => announce("Não foi possível salvar sua posição."));
       }
     } catch {
-      if (ticket === request && !signal.aborted) announce("Não foi possível preparar esta página.");
+      if (ticket === request && !signal.aborted) {
+        showPageAlert(`Não foi possível abrir a página ${index + 1}.`, { index, destination, last, persist });
+      }
     } finally {
       if (ticket === request) article.removeAttribute("aria-busy");
     }
@@ -511,6 +575,7 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
         try {
           await onRemoveHighlight(item.id);
           if (signal.aborted) return;
+          removedHighlights.add(item.id);
           highlights = highlights.filter((highlight) => highlight.id !== item.id);
           clearSelection();
           displayPage();
@@ -574,6 +639,11 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   }
 
   find(".lr-back").addEventListener("click", onExit, { signal });
+  pageRetry.addEventListener("click", () => {
+    if (!retryPage) return;
+    const { index, destination, last, persist } = retryPage;
+    void goTo(index, destination, { last, persist });
+  }, { signal });
   counter.addEventListener("click", (event) => {
     if (event.detail === 0) showControls(!controlsOpen, true);
   }, { signal });
@@ -710,29 +780,31 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   }, { signal });
 
   selectionMenu.addEventListener("mousedown", (event) => event.preventDefault(), { signal });
-  // After a selection drag, the browser can skip the click from the next tap.
-  selectionMenu.addEventListener("pointerdown", (event) => {
-    if (event.pointerType !== "touch") return;
-    const control = event.target.closest("button, a");
-    if (!control) return;
-    event.preventDefault();
-    menuTap = { control, id: event.pointerId, x: event.clientX, y: event.clientY };
-  }, { signal });
-  selectionMenu.addEventListener("pointerup", (event) => {
-    if (event.pointerId !== menuTap?.id) return;
-    const { control, x, y } = menuTap;
-    menuTap = null;
-    if (!control.contains(event.target) || Math.hypot(event.clientX - x, event.clientY - y) > 12) return;
-    lastMenuTouch = { control, at: performance.now() };
-    control.click();
-  }, { signal });
-  selectionMenu.addEventListener("pointercancel", () => { menuTap = null; }, { signal });
-  selectionMenu.addEventListener("click", (event) => {
-    if (!event.isTrusted || event.detail === 0 || !lastMenuTouch?.control.contains(event.target) ||
-        performance.now() - lastMenuTouch.at > 450) return;
-    event.preventDefault();
-    event.stopImmediatePropagation();
-  }, { signal, capture: true });
+  // After a drag or swipe, the browser can skip the click from the next tap.
+  for (const popup of [selectionMenu, pageAlert]) {
+    popup.addEventListener("pointerdown", (event) => {
+      if (event.pointerType !== "touch") return;
+      const control = event.target.closest("button, a");
+      if (!control) return;
+      event.preventDefault();
+      menuTap = { control, id: event.pointerId, x: event.clientX, y: event.clientY };
+    }, { signal });
+    popup.addEventListener("pointerup", (event) => {
+      if (event.pointerId !== menuTap?.id) return;
+      const { control, x, y } = menuTap;
+      menuTap = null;
+      if (!control.contains(event.target) || Math.hypot(event.clientX - x, event.clientY - y) > 12) return;
+      lastMenuTouch = { control, at: performance.now() };
+      control.click();
+    }, { signal });
+    popup.addEventListener("pointercancel", () => { menuTap = null; }, { signal });
+    popup.addEventListener("click", (event) => {
+      if (!event.isTrusted || event.detail === 0 || !lastMenuTouch?.control.contains(event.target) ||
+          performance.now() - lastMenuTouch.at > 450) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, { signal, capture: true });
+  }
   scroll.addEventListener("contextmenu", (event) => {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || !article.contains(selection.anchorNode) ||
@@ -787,16 +859,21 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   const cleanup = () => {
     controller.abort();
     layoutController.abort();
+    cancelPageLoad();
     observer?.disconnect();
     clearTimeout(tapTimer);
     clearTimeout(selectionTimer);
     clearTimeout(notificationTimer);
   };
-  cleanup.updateBook = ({ pages: nextPages, pageCount, loading: nextLoading, title, highlights: nextHighlights }) => {
+  cleanup.updateBook = ({
+    pages: nextPages, pageCount, loading: nextLoading, title, highlights: nextHighlights,
+    loadPage: nextLoader, additionalHighlights,
+  }) => {
     if (signal.aborted) return;
     if (nextPages) pages = nextPages;
     if (pageCount !== undefined) knownCount = pageCount;
     if (nextLoading !== undefined) loading = nextLoading;
+    if (nextLoader !== undefined) loadPage = nextLoader;
     if (title !== undefined) displayTitle(title);
     displayLoading();
     displayNavigation();
@@ -805,6 +882,22 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
       clearSelection();
       displayHighlights();
       displayPage();
+    }
+    if (additionalHighlights?.length) {
+      const known = new Set([...highlights.map(({ id }) => id), ...removedHighlights]);
+      const length = highlights.length;
+      for (const mark of additionalHighlights) {
+        if (known.has(mark.id)) continue;
+        known.add(mark.id);
+        highlights.push(mark);
+      }
+      if (highlights.length !== length) {
+        displayHighlights();
+        if (highlights.slice(length).some((mark) => mark.page === page)) {
+          if (hasReadingSelection()) highlightRepaintPending = true;
+          else displayPage();
+        }
+      }
     }
     if (displayed !== pages[page]) {
       void goTo(page, anchor, { persist: false });

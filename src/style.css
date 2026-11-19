@@ -212,6 +212,12 @@ svg { width: 1.15rem; height: 1.15rem; flex: none; }
   background: #dce4d7;
   accent-color: #526e54;
 }
+.opening-book-progress {
+  display: block;
+  width: 100%;
+  margin: 0 0 16px;
+  accent-color: #526e54;
+}
 .import-summary-button progress::-webkit-progress-bar,
 .import-meter progress::-webkit-progress-bar { background: #dce4d7; }
 .import-summary-button progress::-webkit-progress-value,

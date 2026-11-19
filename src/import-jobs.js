@@ -63,10 +63,16 @@ const loadJob = (db, accountId) => transact(db, ['jobs'], 'readonly', transactio
   value(transaction.objectStore('jobs').get(accountId)))
 
 async function saveJob(db, job, isNew = false) {
-  return transact(db, ['jobs'], 'readwrite', async transaction => {
+  const stores = isNew ? ['jobs', 'pages'] : ['jobs']
+  return transact(db, stores, 'readwrite', async transaction => {
     const store = transaction.objectStore('jobs')
-    if (isNew) return value(store.add(job))
-    if ((await value(store.get(job.accountId)))?.id !== job.id) return
+    const previous = await value(store.get(job.accountId))
+    if (isNew) {
+      if (!previous?.completed) return value(store.add(job))
+      await removePages(transaction, previous.id)
+      return value(store.put(job))
+    }
+    if (previous?.id !== job.id || previous.completed) return
     return value(store.put(job))
   })
 }
@@ -79,14 +85,32 @@ const loadPages = (db, jobId, start, end) => transact(db, ['pages'], 'readonly',
   return value(transaction.objectStore('pages').getAll(range))
 })
 
+async function removePages(transaction, id) {
+  const pages = transaction.objectStore('pages')
+  const keys = await value(pages.index('byJob').getAllKeys(id))
+  await Promise.all(keys.map(key => value(pages.delete(key))))
+}
+
+async function markJobComplete(db, accountId, id, fallbackPages) {
+  await transact(db, ['jobs'], 'readwrite', async transaction => {
+    const jobs = transaction.objectStore('jobs')
+    if ((await value(jobs.get(accountId)))?.id !== id) return
+    await value(jobs.put({ id, accountId, completed: true, fallbackPages }))
+  })
+}
+
 async function removeJob(db, accountId, id) {
   await transact(db, ['jobs', 'pages'], 'readwrite', async transaction => {
     const jobs = transaction.objectStore('jobs')
-    const pages = transaction.objectStore('pages')
     if ((await value(jobs.get(accountId)))?.id !== id) return
-    const pageKeys = await value(pages.index('byJob').getAllKeys(id))
-    await Promise.all([value(jobs.delete(accountId)), ...pageKeys.map(key => value(pages.delete(key)))])
+    await Promise.all([value(jobs.delete(accountId)), removePages(transaction, id)])
   })
+}
+
+async function finishStoredJob(db, accountId, id, fallbackPages) {
+  // Keep only a receipt if the browser cannot remove the saved pages.
+  await markJobComplete(db, accountId, id, fallbackPages).catch(() => {})
+  await removeJob(db, accountId, id).catch(() => {})
 }
 
 function delay(milliseconds, signal) {
@@ -184,6 +208,7 @@ function appendCheckpoints(preview, checkpoints, persisted) {
 
 export function createImportManager({ uploadBook, onChange, onComplete }) {
   const local = new Map()
+  const completed = new Set()
   let channel
   try {
     channel = new BroadcastChannel(databaseName)
@@ -252,6 +277,28 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
     if (scope.persisted) channel?.postMessage({ type, accountId: scope.accountId, jobId, ...extra })
   }
 
+  function complete(scope, result, share = false) {
+    const { id, fallbackPages } = result
+    const first = !completed.has(id)
+    completed.add(id)
+    clearJob(scope, id)
+    if (!first) return
+    if (share) broadcast('complete', scope, id, { fallbackPages })
+    notify(scope, result)
+  }
+
+  function reconcileSavedBook(scope, book) {
+    if (!book || scope.job?.id !== book.id) return false
+    const { id, fallbackPages = [] } = scope.job
+    scope.worker?.abort()
+    complete(scope, { id, book, fallbackPages }, true)
+    if (scope.persisted) {
+      void withLock(scope.db, scope.accountId, scope.signal, () =>
+        finishStoredJob(scope.db, scope.accountId, id, fallbackPages)).catch(() => {})
+    }
+    return true
+  }
+
   function sendProgress(scope) {
     if (context !== scope || !scope.executing || !current) return
     const { id, status, phase, percent, pageCount } = current
@@ -275,16 +322,30 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
     publish(scope, { status: 'error', phase: 'Importação interrompida', error: message })
   }
 
-  async function readScope(scope) {
+  async function readScope(scope, savedBooks = []) {
     const db = await openDatabase()
-    const saved = db && await loadJob(db, scope.accountId).catch(() => null)
+    let saved = db && await loadJob(db, scope.accountId).catch(() => null)
     if (context !== scope) return
     scope.db = db
+    const book = saved && savedBooks.find(item => item.id === saved.id)
+    if (book) {
+      scope.job = saved
+      scope.persisted = true
+      reconcileSavedBook(scope, book)
+      saved = null
+    }
+    if (saved && (saved.completed || completed.has(saved.id))) {
+      completed.add(saved.id)
+      clearJob(scope, saved.id)
+      void removeJob(db, scope.accountId, saved.id).catch(() => {})
+      saved = null
+    }
     const remembered = local.get(scope.accountId)
     scope.job = saved || remembered?.job
     scope.persisted = Boolean(saved)
     if (remembered && scope.job?.id !== remembered.job.id) local.delete(scope.accountId)
     if (scope.job) {
+      if (reconcileSavedBook(scope, savedBooks.find(item => item.id === scope.job.id))) return
       await syncPreview(scope).catch(() => {})
       if (context !== scope || !scope.job) return
       if (remembered?.job.id === scope.job.id) {
@@ -302,6 +363,11 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
       const saved = await loadJob(scope.db, scope.accountId)
       if (saved?.id !== id) {
         clearJob(scope, id)
+        return
+      }
+      if (saved.completed || completed.has(id)) {
+        complete(scope, { id, book: null, fallbackPages: saved.fallbackPages ?? [] })
+        await removeJob(scope.db, scope.accountId, id).catch(() => {})
         return
       }
       scope.job = saved
@@ -376,10 +442,11 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
       }
     }
 
-    if (scope.persisted) await removeJob(scope.db, scope.accountId, id)
-    clearJob(scope, id)
-    broadcast('complete', scope, id, { fallbackPages: document.fallbackPages })
-    notify(scope, { id, book, fallbackPages: document.fallbackPages })
+    const { fallbackPages } = document
+    complete(scope, { id, book, fallbackPages }, true)
+    if (scope.persisted) {
+      await finishStoredJob(scope.db, scope.accountId, id, fallbackPages)
+    }
   }
 
   async function fail(scope, id, error) {
@@ -447,12 +514,13 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
         }).catch(() => {})
       }
     }
-    if (data.type === 'complete' || data.type === 'discard') {
-      if (scope.job?.id === data.jobId) {
-        scope.worker?.abort()
-        clearJob(scope, data.jobId)
-      }
-      if (data.type === 'complete') notify(scope, { id: data.jobId, book: null, fallbackPages: data.fallbackPages ?? [] })
+    if (data.type === 'complete') {
+      if (scope.job?.id === data.jobId) scope.worker?.abort()
+      complete(scope, { id: data.jobId, book: null, fallbackPages: data.fallbackPages ?? [] })
+    }
+    if (data.type === 'discard' && scope.job?.id === data.jobId) {
+      scope.worker?.abort()
+      clearJob(scope, data.jobId)
     }
     if (data.type === 'start' && !scope.job && !scope.starting) {
       scope.loading = readScope(scope)
@@ -496,14 +564,21 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
       }
     },
 
-    setAccount(accountId) {
-      if (context && context.accountId === accountId) return context.loading
+    setAccount(accountId, { savedBooks = [] } = {}) {
+      if (context && context.accountId === accountId) {
+        const scope = context
+        if (!savedBooks.length) return scope.loading
+        return scope.loading.then(() => {
+          if (context !== scope || !scope.job) return
+          reconcileSavedBook(scope, savedBooks.find(book => book.id === scope.job.id))
+        })
+      }
       context?.controller.abort()
       const controller = new AbortController()
       context = accountId ? { accountId, controller, signal: controller.signal } : null
       publish(context, null)
       if (context) {
-        context.loading = readScope(context)
+        context.loading = readScope(context, savedBooks)
         return context.loading
       }
     },

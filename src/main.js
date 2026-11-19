@@ -39,6 +39,7 @@ let readerCleanup
 let readerBook
 let readerSession
 let readerRequest = 0
+let openingBook
 let toastTimeout
 const imports = createImportManager({
   uploadBook,
@@ -69,10 +70,10 @@ async function api(path, { method = 'GET', data, signal } = {}) {
   return body
 }
 
-async function listAll(path, field, offset = 0) {
+async function listAll(path, field, offset = 0, request = api) {
   const entries = []
   while (offset != null) {
-    const page = await api(`${path}?offset=${offset}`)
+    const page = await request(`${path}?offset=${offset}`)
     entries.push(...page[field])
     offset = page.nextOffset
   }
@@ -121,19 +122,43 @@ async function uploadBook(document, onProgress, { id, accountId, signal }) {
   return (await api(`${path}/complete`, { method: 'POST', signal })).book
 }
 
-async function loadBook(id) {
-  const path = `/books/${id}`
-  const { book } = await api(`${path}?metadata=1`)
-  const [parts, additionalHighlights] = await Promise.all([
-    transferParts(book.partCount, async part => (await api(`${path}/data?part=${part}`)).chunk),
-    book.nextHighlightOffset == null
-      ? []
-      : listAll(`${path}/highlights`, 'highlights', book.nextHighlightOffset),
-  ])
-  return {
-    ...book,
-    pages: JSON.parse(parts.join('')),
-    highlights: [...book.highlights, ...additionalHighlights],
+async function readRequest(path, signal) {
+  signal?.throwIfAborted()
+  const controller = new AbortController()
+  const cancel = () => controller.abort(signal.reason)
+  signal?.addEventListener('abort', cancel, { once: true })
+  const timer = setTimeout(() => controller.abort(), 20_000)
+  try {
+    return await api(path, { signal: controller.signal })
+  } catch (error) {
+    signal?.throwIfAborted()
+    if (controller.signal.aborted) throw new Error('A resposta demorou demais. Tente novamente.')
+    if (error instanceof TypeError) throw new Error('A conexão falhou. Tente novamente.')
+    throw error
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', cancel)
+  }
+}
+
+function savedPageLoader(id) {
+  return async (page, signal) => {
+    const path = `/books/${id}/page?page=${page}`
+    const { chunk, partCount } = await readRequest(path, signal)
+    if (typeof chunk !== 'string' || !Number.isSafeInteger(partCount) || partCount < 1) {
+      throw new Error('Não foi possível ler o conteúdo desta página.')
+    }
+    const remaining = await transferParts(partCount - 1, async index => (
+      (await readRequest(`${path}&part=${index + 1}`, signal)).chunk
+    ))
+    let content
+    try {
+      content = JSON.parse([chunk, ...remaining].join(''))
+    } catch {
+      throw new Error('Não foi possível ler o conteúdo desta página.')
+    }
+    if (!Array.isArray(content?.blocks)) throw new Error('Não foi possível ler o conteúdo desta página.')
+    return content
   }
 }
 
@@ -454,13 +479,13 @@ function showUpload() {
 
 async function setupImports() {
   try {
-    await imports.setAccount(user?.id ?? null)
+    await imports.setAccount(user?.id ?? null, { savedBooks: books })
   } catch (error) {
     announce(error.message)
   }
 }
 
-async function finishUpload({ id, book, fallbackPages }, accountId) {
+function finishUpload({ id, book, fallbackPages }, accountId) {
   if (user?.id !== accountId) return
   const completedId = id ?? book?.id
   const liveReader = readerBook?.id === completedId && readerSession?.preview ? readerSession : null
@@ -469,29 +494,22 @@ async function finishUpload({ id, book, fallbackPages }, accountId) {
   const sync = syncPendingReading(api, accountId, completedId).catch(error => announce(error.message))
   if (book) {
     books = [book, ...books.filter(item => item.id !== book.id)]
-  } else {
-    try { await refreshBooks() } catch (error) { return announce(error.message) }
+    renderBookList()
   }
-  if (user?.id !== accountId) return
-  renderBookList()
   if (liveReader && readerSession === liveReader) {
-    try {
-      const item = book ?? books.find(item => item.id === completedId)
-      const pages = readerBook?.pages?.length === item?.pageCount ? readerBook.pages : (await loadBook(completedId)).pages
-      if (readerSession === liveReader) {
-        const patch = { pages, pageCount: pages.length, title: item?.title ?? readerBook.title, loading: null }
-        readerBook = { ...readerBook, ...patch }
-        readerCleanup?.updateBook(patch)
-      }
-    } catch (error) {
-      if (readerSession === liveReader) {
-        liveReader.preview = true
-        announce(error.message)
-      }
+    const item = book ?? books.find(item => item.id === completedId)
+    const patch = {
+      loadPage: savedPageLoader(completedId),
+      pageCount: item?.pageCount ?? readerBook.pageCount,
+      title: item?.title ?? readerBook.title,
+      loading: null,
     }
+    readerBook = { ...readerBook, ...patch }
+    readerCleanup?.updateBook(patch)
   }
-  if (draft.position || draft.highlights.length) {
-    void sync.then(async () => {
+  if (!book || draft.position || draft.highlights.length) {
+    const ready = book ? sync : Promise.resolve()
+    void ready.then(async () => {
       if (user?.id !== accountId) return
       await refreshBooks()
       renderBookList()
@@ -501,12 +519,12 @@ async function finishUpload({ id, book, fallbackPages }, accountId) {
   const message = count
     ? `PDF adicionado. ${count === 1 ? 'Uma página foi preservada como imagem.' : `${count} páginas foram preservadas como imagens.`}`
     : 'PDF adicionado à biblioteca.'
-  if (dialog.open && dialog.dataset.view === 'import-progress' && dialog.dataset.importId === (id ?? book?.id)) {
+  if (dialog.open && dialog.dataset.view === 'import-progress' && dialog.dataset.importId === completedId) {
     showDialog('Importação concluída', `
       <p class="modal-description">${escape(message)}</p>
       <div class="modal-actions">
         <button class="button secondary" type="button" data-action="close-dialog">Fechar</button>
-        ${book ? `<button class="button primary" type="button" data-action="read-import" data-book="${escape(book.id)}">Ler agora</button>` : ''}
+        ${completedId ? `<button class="button primary" type="button" data-action="read-import" data-book="${escape(completedId)}">Ler agora</button>` : ''}
       </div>`)
   } else {
     announce(message)
@@ -569,27 +587,68 @@ function readAvailablePages() {
   void openBook(job.id)
 }
 
-async function loadSavedReading(id, account) {
-  await syncPendingReading(api, account, id).catch(error => announce(error.message))
-  return loadBook(id)
+async function loadSavedReading(id, requestedPage, signal) {
+  const { book } = await readRequest(`/books/${id}?metadata=1&paged=1`, signal)
+  const position = requestedPage ?? book.currentPage ?? 0
+  const initialPage = Number.isInteger(position) && position >= 0 && position < book.pageCount ? position : 0
+  const pages = new Array(book.pageCount)
+  const loadPage = savedPageLoader(id)
+  pages[initialPage] = await loadPage(initialPage, signal)
+  return { ...book, pages, loadPage, initialPage }
+}
+
+function showOpeningBook(title) {
+  showDialog('Abrindo livro', `
+    <p class="modal-description">${escape(title)}</p>
+    <progress class="opening-book-progress" aria-label="Carregando a página de leitura"></progress>
+    <div class="modal-actions"><button class="button secondary" type="button" data-action="close-dialog">Cancelar</button></div>`,
+  'open-book')
+}
+
+function showOpenFailure(error, retry, reload) {
+  showDialog('Não foi possível abrir o livro', `
+    <p class="modal-description" role="alert">${escape(error.message)}</p>
+    <div class="modal-actions">
+      <button class="button secondary" type="button" data-action="close-dialog">Fechar</button>
+      <button class="button primary" type="button" id="retry-open-book">${reload ? 'Atualizar página' : 'Tentar novamente'}</button>
+    </div>`, 'open-book-error')
+  dialog.querySelector('#retry-open-book').onclick = reload ? () => window.location.reload() : retry
 }
 
 async function openBook(id, explicitPage, explicitAnchor) {
   const request = ++readerRequest
   const account = user?.id
   const sample = sampleBooks.find(book => book.id === id)
-  const preview = imports.getPreview(id)
+  const saved = books.find(book => book.id === id)
+  const preview = saved ? null : imports.getPreview(id)
   if (preview && !preview.pages.length) return showImportProgress()
+  openingBook?.abort()
+  const controller = new AbortController()
+  openingBook = controller
+  const { signal } = controller
+  const pending = sample ? null : pendingReading(account, id)
+  const requestedPage = explicitPage ?? pending?.position?.page
+  const title = sample?.title ?? saved?.title ?? preview?.title ?? 'Carregando a página de leitura…'
+  if (!sample && !preview) showOpeningBook(title)
+  let moduleFailed = false
+  const active = () => request === readerRequest && user?.id === account && !signal.aborted
   try {
     const [initial, reader] = await Promise.all([
-      sample ?? preview ?? loadSavedReading(id, account),
-      import('./reader.js'),
+      sample ?? preview ?? loadSavedReading(id, requestedPage, signal),
+      import('./reader.js').catch(() => {
+        moduleFailed = true
+        throw new Error('Atualize a página para carregar o leitor.')
+      }),
     ])
-    const book = preview ? imports.getPreview(id) ?? await loadSavedReading(id, account) : initial
-    if (request !== readerRequest || user?.id !== account) return
+    if (!active()) return
+    let book = preview ? imports.getPreview(id) : initial
+    if (!book) {
+      showOpeningBook(title)
+      book = await loadSavedReading(id, requestedPage, signal)
+    }
+    if (!active()) return
     const sampleProgress = sample ? sampleState(sample, account) : null
-    const pending = sample ? null : pendingReading(account, id)
-    const position = explicitPage ?? (sample ? sampleProgress.position : pending.position?.page ?? book.currentPage ?? 0)
+    const position = book.initialPage ?? explicitPage ?? (sample ? sampleProgress.position : pending.position?.page ?? 0)
     const anchor = explicitAnchor ?? (explicitPage === undefined
       ? (sample ? sampleProgress.anchor : pending.position?.anchor ?? book.anchor)
       : null)
@@ -622,6 +681,7 @@ async function openBook(id, explicitPage, explicitAnchor) {
     document.title = `${book.title} — Margem`
     readerCleanup = reader.renderReader(app, {
       book: readerBook,
+      loadPage: book.loadPage,
       onExit: () => {
         renderShell()
         window.scrollTo(0, 0)
@@ -657,11 +717,29 @@ async function openBook(id, explicitPage, explicitAnchor) {
         books = books.map(item => item.id === id ? { ...item, highlightCount: Math.max(0, (item.highlightCount ?? 1) - 1) } : item)
       },
     })
+    if (openingBook === controller) openingBook = undefined
+    if (dialog.open && dialog.dataset.view === 'open-book') dialog.close()
     themeColor?.setAttribute('content', '#ffffff')
-    if (explicitPage !== undefined) void savePosition(explicitPage, explicitAnchor).catch(error => announce(error.message))
+    if (!session.preview && !sample && (pending.position || pending.highlights.length)) {
+      void syncPendingReading(api, account, id).catch(error => { if (readerSession === session) announce(error.message) })
+    }
+    if (book.nextHighlightOffset != null) {
+      void listAll(`/books/${id}/highlights`, 'highlights', book.nextHighlightOffset, readRequest)
+        .then(additionalHighlights => {
+          if (readerSession === session) readerCleanup.updateBook({ additionalHighlights })
+        }).catch(error => { if (readerSession === session) announce(error.message) })
+    }
+    if (explicitPage !== undefined) void savePosition(position, explicitAnchor).catch(error => announce(error.message))
     window.scrollTo(0, 0)
   } catch (error) {
-    announce(error.message)
+    if (active()) {
+      showOpenFailure(error, () => void openBook(id, explicitPage, explicitAnchor), moduleFailed)
+    }
+  } finally {
+    if (openingBook === controller) {
+      openingBook = undefined
+      controller.abort()
+    }
   }
 }
 
@@ -695,10 +773,17 @@ app.addEventListener('input', event => {
   renderBookList()
 })
 
+dialog.addEventListener('cancel', () => {
+  if (dialog.dataset.view === 'open-book') openingBook?.abort()
+})
+
 dialog.addEventListener('click', async event => {
   const button = event.target.closest('button')
   const action = button?.dataset.action
-  if (event.target === dialog || action === 'close-dialog') dialog.close()
+  if (event.target === dialog || action === 'close-dialog') {
+    if (dialog.dataset.view === 'open-book') openingBook?.abort()
+    dialog.close()
+  }
   if (action === 'read-import') {
     dialog.close()
     void openBook(button.dataset.book)
