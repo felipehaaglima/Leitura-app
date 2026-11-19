@@ -63,6 +63,13 @@
   --lr-input-border: var(--lr-border);
   --lr-toolbar: #151a1f;
   --lr-toolbar-ink: #f0ede8;
+  --lr-touch-shade: #8ebfdb2e;
+  --lr-touch-handle: #9bcbee;
+}
+
+.lr-reader:is([data-theme="dusk"], [data-theme="night"]) .lr-paper ::selection {
+  color: var(--lr-reading-ink);
+  background: #405570;
 }
 
 .lr-reader,

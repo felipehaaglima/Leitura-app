@@ -28,7 +28,7 @@
 
 .lr-touch-shade {
   position: absolute;
-  background: #8ebfdb74;
+  background: var(--lr-touch-shade, #8ebfdb74);
   border-radius: 2px;
 }
 
@@ -53,6 +53,6 @@
   height: 10px;
   content: '';
   border-radius: 50%;
-  background: #456c80;
+  background: var(--lr-touch-handle, #456c80);
   transform: translateX(-50%);
 }
