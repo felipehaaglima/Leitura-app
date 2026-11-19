@@ -37,6 +37,15 @@ export function addPendingHighlight(account, id, data) {
   return highlight
 }
 
+export function updatePendingHighlight(account, id, highlightId, changes) {
+  const key = `${prefix(account, id)}destaque:${highlightId}`
+  const mark = read(key)
+  if (!mark) throw new Error('Destaque não encontrado.')
+  const highlight = { ...mark, ...changes }
+  localStorage.setItem(key, JSON.stringify(highlight))
+  return highlight
+}
+
 export function removePendingHighlight(account, id, highlightId) {
   try {
     localStorage.removeItem(`${prefix(account, id)}destaque:${highlightId}`)
@@ -68,8 +77,8 @@ export function syncPendingReading(api, account, id) {
       for (const key of highlightKeys(account, id)) {
         const highlight = read(key)
         if (!highlight) continue
-        const { id: markId, page, block, start, end, color } = highlight
-        await api(`/books/${id}/highlights`, { method: 'POST', data: { id: markId, page, block, start, end, color } })
+        const { id: markId, page, block, start, end, color, note, scope } = highlight
+        await api(`/books/${id}/highlights`, { method: 'POST', data: { id: markId, page, block, start, end, color, note, scope } })
         localStorage.removeItem(key)
       }
     })().finally(() => syncing.delete(start))

@@ -1,0 +1,242 @@
+.social-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.social-connect,
+.social-board {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.social-connect {
+  margin-bottom: 26px;
+}
+
+.social-connect-item,
+.social-panel {
+  min-width: 0;
+  padding: clamp(15px, 2.1vw, 24px);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fdfcf8;
+}
+
+.social-connect-item:first-child {
+  border-color: #dce4da;
+  background: #edf2e9;
+}
+
+.social-panel h2,
+.social-connect h2,
+.social-profile-heading h2 {
+  margin: 0;
+  color: var(--ink);
+  font: 400 2rem/1.08 var(--serif);
+  overflow-wrap: anywhere;
+}
+
+.social-connect-item p,
+.social-guest p {
+  margin: 7px 0 16px;
+  color: var(--muted);
+}
+
+.social-inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.social-inline-form input {
+  flex: 1 1 9rem;
+  min-width: 0;
+  padding: 9px 11px;
+  border: 1px solid #d3dbcf;
+  border-radius: 8px;
+  color: var(--ink);
+  background: #fffefa;
+}
+
+.social-inline-form input[readonly] {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: .88rem;
+}
+
+.social-board {
+  align-items: start;
+}
+
+.social-empty {
+  margin: 10px 0 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.social-feedback {
+  margin: 0 0 15px;
+  padding: 10px 12px;
+  border: 1px solid #dce4da;
+  border-radius: 8px;
+  color: var(--ink);
+  background: #edf2e9;
+  overflow-wrap: anywhere;
+}
+
+.social-feedback-error {
+  border-color: #efd5cf;
+  color: #862f28;
+  background: #fff2ee;
+}
+
+.social-friends,
+.social-request-group ul,
+.social-books {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.social-friend {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  width: 100%;
+  min-height: 52px;
+  padding: 6px;
+  gap: 10px;
+  text-align: left;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+}
+
+.social-friend:hover {
+  background: #edf2e9;
+}
+
+.social-friend-name {
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.social-friend-link {
+  color: var(--muted);
+  font-size: .9rem;
+}
+
+.social-avatar {
+  display: grid;
+  width: 38px;
+  aspect-ratio: 1;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid #dce4da;
+  border-radius: 50%;
+  color: var(--ink);
+  background: #e8ede4;
+  font-size: .82rem;
+  font-weight: 750;
+}
+
+.social-request-group {
+  margin-top: 18px;
+}
+
+.social-request-group h3,
+.social-panel > h3 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 1rem;
+}
+
+.social-request-group ul {
+  margin-top: 6px;
+}
+
+.social-request,
+.social-book {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  padding-block: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.social-row-description {
+  flex: 1 1 10rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.social-row-description p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: .9rem;
+}
+
+.social-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.social-profile-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 20px 0;
+}
+
+.social-profile-heading .social-avatar {
+  width: 52px;
+  font-size: 1rem;
+}
+
+.social-profile-heading h2 {
+  font-size: clamp(2.2rem, 5vw, 3.15rem);
+}
+
+.social-book h3 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 1.05rem;
+}
+
+.social-reading-progress {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: .88rem;
+}
+
+.social-reading-progress progress {
+  width: min(100%, 7rem);
+  height: .45rem;
+  accent-color: #526e54;
+}
+
+.social-page [data-social-action=more] {
+  margin-top: 10px;
+}
+
+@media (max-width: 780px) {
+  .social-connect,
+  .social-board {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 400px) {
+  .social-inline-form input {
+    flex-basis: 100%;
+  }
+}

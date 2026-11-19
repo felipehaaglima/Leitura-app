@@ -35,6 +35,7 @@ O servidor cria as tabelas na primeira operação que precisa do banco. Na Verce
 ## Leitura e dados
 
 - No celular, deslize para a esquerda para avançar e para a direita para voltar. Também é possível usar as setas do teclado. Toque no centro para abrir os controles. Páginas longas são divididas em partes como `1a`, `1b` e `1c`, ajustadas à tela.
+- O botão Voltar do navegador ou do celular leva do leitor à biblioteca.
 - No celular, pressione uma palavra para selecioná-la e arraste as alças para ampliar a seleção. Use o menu do Margem para destacar, consultar o Wikcionário ou abrir a tradução no Google Tradutor. Os links enviam o termo ou trecho selecionado ao serviço escolhido.
 - O PDF é processado no navegador. O Tesseract reconhece texto em português e inglês em páginas digitalizadas ou com uma camada de texto ilegível. O arquivo original permanece no dispositivo e o servidor recebe o texto e as imagens preparados para o leitor. Para recuperar um livro afetado por caracteres ilegíveis em uma importação anterior, importe novamente o PDF original.
 - A importação aceita PDFs de até 80 MB e 500 páginas. A recuperação de texto e figuras depende da qualidade do escaneamento e do layout. Páginas em que o OCR não encontra texto legível podem aparecer como imagem.
@@ -42,3 +43,10 @@ O servidor cria as tabelas na primeira operação que precisa do banco. Na Verce
 - A porcentagem da importação fica visível na biblioteca depois de fechar a janela de importação. Com a aba aberta, o processamento segue em segundo plano. Ao voltar no mesmo navegador após fechar a aba ou recarregar a página, a importação retoma a partir do progresso salvo. O arquivo usado na retomada fica temporariamente no navegador e é removido ao concluir ou descartar a importação.
 - Use **Ler páginas disponíveis** assim que a primeira página estiver pronta. As próximas aparecem no leitor conforme forem processadas. O progresso e os destaques dessa leitura são salvos no livro ao concluir a importação.
 - Use a lixeira no cartão de um PDF para apagá-lo da biblioteca. A confirmação também remove o progresso e os destaques daquele livro.
+- O destaque oferece três cores iniciais. Em **Aparência**, adicione outras cores à sua conta. Para anotar um trecho, escolha **Adicionar nota** ao selecionar o texto ou edite uma nota nos destaques do leitor.
+
+## Social
+
+- Copie seu ID na aba **Social** e use o ID de outra pessoa para enviar um pedido de amizade. Após o aceite, vocês podem visitar os perfis e ver os livros e o progresso um do outro.
+- No perfil de um amigo, solicite uma cópia de um livro. Quando o dono aprova, a cópia entra na sua biblioteca com o nome de quem compartilhou. Ela tem progresso e destaques próprios.
+- No leitor de um livro compartilhado, toque no centro e abra **Leitura em grupo** para convidar quem tem uma cópia. Quem aceitar passa a ver a posição dos participantes e os destaques que eles escolherem compartilhar. Cada destaque com nota pode ficar pessoal ou visível para o grupo.

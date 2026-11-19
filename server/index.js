@@ -7,6 +7,7 @@ import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createStorage } from './database.js';
+import { createSocialAPI } from './social.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const dataDirectory = resolve(process.env.LEITURA_DATA_DIR || resolve(root, 'data'));
@@ -29,10 +30,12 @@ const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const deletedImport = 2;
 const bookBatchSize = 6;
 const highlightBatchSize = 48;
+const maxHighlightNoteLength = 2_000;
 const scryptAsync = promisify(scrypt);
 const dummySalt = randomBytes(16);
 const dummyKey = randomBytes(64);
-const colors = new Set(['yellow', 'green', 'pink']);
+const presetColors = new Set(['yellow', 'green', 'pink']);
+const highlightScopes = new Set(['private', 'group']);
 const hostedResponses = new WeakSet();
 
 const storage = createStorage({ connectionString: process.env.DATABASE_URL, directory: dataDirectory });
@@ -48,6 +51,9 @@ const summaryFields = `
   id, title, thumbnail, page_count AS "pageCount", current_page AS "currentPage",
   current_block AS "currentBlock", current_offset AS "currentOffset",
   created_at AS "createdAt", updated_at AS "updatedAt",
+  (SELECT from_user_id FROM book_origins WHERE book_id = books.id) AS "referrerId",
+  (SELECT users.name FROM book_origins JOIN users ON users.id = book_origins.from_user_id
+   WHERE book_origins.book_id = books.id) AS "referrerName",
   CAST((SELECT count(*) FROM highlights WHERE highlights.book_id = books.id) AS INTEGER) AS "highlightCount"
 `;
 
@@ -61,17 +67,31 @@ const updateProgressSql = `
   UPDATE books SET current_page = ?, current_block = ?, current_offset = ?, updated_at = ?
   WHERE id = ? AND owner_id = ? AND page_count > ?
 `;
-const highlightFields = 'id, page, block, "start", "end", text, color, created_at AS "createdAt"';
+const highlightFields = `
+  highlights.id, highlights.page, highlights.block, highlights."start", highlights."end",
+  highlights.text, highlights.color, highlights.created_at AS "createdAt",
+  COALESCE(highlight_details.note, '') AS note, COALESCE(highlight_details.scope, 'private') AS scope
+`;
+const highlightDetailsJoin = 'LEFT JOIN highlight_details ON highlight_details.highlight_id = highlights.id';
+const highlightByIdSql = `
+  SELECT ${highlightFields}
+  FROM highlights ${highlightDetailsJoin}
+  WHERE highlights.id = ? AND highlights.book_id = ?
+`;
+const editableHighlightSql = highlightByIdSql + (storage.postgres ? ' FOR UPDATE OF highlights' : '');
 const listHighlightsSql = `
   SELECT ${highlightFields}
-  FROM highlights WHERE book_id = ? ORDER BY page, block, "start", created_at, id
+  FROM highlights ${highlightDetailsJoin}
+  WHERE highlights.book_id = ?
+  ORDER BY highlights.page, highlights.block, highlights."start", highlights.created_at, highlights.id
 `;
 const listAccountHighlightsSql = `
-  SELECT books.id AS "bookId", books.title, highlights.id, page, block, "start", "end", text, color,
-         highlights.created_at AS "createdAt"
+  SELECT books.id AS "bookId", books.title, ${highlightFields}
   FROM books JOIN highlights ON highlights.book_id = books.id
+  ${highlightDetailsJoin}
   WHERE books.owner_id = ?
-  ORDER BY books.updated_at DESC, books.id, page, block, "start", highlights.created_at, highlights.id
+  ORDER BY books.updated_at DESC, books.id, highlights.page, highlights.block, highlights."start",
+           highlights.created_at, highlights.id
 `;
 const getBlockSql = storage.postgres
   ? `SELECT ((pages_json::jsonb -> (?::integer) -> 'blocks' -> (?::integer)) - 'src'::text)::text AS block,
@@ -117,6 +137,8 @@ class HttpError extends Error {
     this.status = status;
   }
 }
+
+const social = createSocialAPI({ storage, readJson, respondJson, HttpError });
 
 function respondJson(response, status, body) {
   const payload = JSON.stringify(body);
@@ -318,8 +340,12 @@ function sanitizeBlock(block) {
   throw new HttpError(400, 'O livro contém um trecho em formato inválido.');
 }
 
-function formatBookSummary({ currentBlock, currentOffset, ...summary }) {
-  return { ...summary, anchor: { block: currentBlock, offset: currentOffset } };
+function formatBookSummary({ currentBlock, currentOffset, referrerId, referrerName, ...summary }) {
+  return {
+    ...summary,
+    anchor: { block: currentBlock, offset: currentOffset },
+    recommendedBy: referrerId ? { id: referrerId, name: referrerName } : null,
+  };
 }
 
 async function saveBook(connection, id, userId, body) {
@@ -393,15 +419,69 @@ function getBookBlock(connection, page, block, bookId, userId) {
   return connection.get(getBlockSql, ...location, bookId, userId);
 }
 
+function hexColor(value) {
+  return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value) ? value.toLowerCase() : null;
+}
+
+async function readerColors(response, userId) {
+  const rows = await storage.all('SELECT color FROM reader_colors WHERE user_id = ? ORDER BY created_at DESC, color', userId);
+  return respondJson(response, 200, { colors: rows.map(({ color }) => color) });
+}
+
+async function saveReaderColor(request, response, userId) {
+  const { color } = await readJson(request);
+  const normalized = hexColor(color);
+  if (!normalized) throw new HttpError(400, 'Cor inválida.');
+  await storage.run(`
+    INSERT INTO reader_colors (user_id, color, created_at) VALUES (?, ?, ?)
+    ON CONFLICT (user_id, color) DO UPDATE SET created_at = excluded.created_at
+  `, userId, normalized, Date.now());
+  return readerColors(response, userId);
+}
+
+function highlightNote(value) {
+  if (value === null) return '';
+  if (typeof value !== 'string') throw new HttpError(400, 'Observação inválida.');
+  const note = cleanText(value.trim());
+  if (note.length > maxHighlightNoteLength) {
+    throw new HttpError(400, `A observação pode ter até ${maxHighlightNoteLength} caracteres.`);
+  }
+  return note;
+}
+
+function highlightScope(value) {
+  if (!highlightScopes.has(value)) throw new HttpError(400, 'Visibilidade de destaque inválida.');
+  return value;
+}
+
+async function verifyHighlightSharing(connection, bookId, userId) {
+  if (!await social.canShareHighlight(bookId, userId, connection)) {
+    throw new HttpError(403, 'Vincule este livro a um grupo para compartilhar destaques.');
+  }
+}
+
+function writeHighlightDetails(connection, id, note, scope) {
+  return connection.run(`
+    INSERT INTO highlight_details (highlight_id, note, scope) VALUES (?, ?, ?)
+    ON CONFLICT (highlight_id) DO UPDATE SET note = excluded.note, scope = excluded.scope
+  `, id, note, scope);
+}
+
 async function saveHighlight(request, response, bookId, userId) {
-  const { id: clientId, page, block, start, end, color = 'yellow' } = await readJson(request);
+  const {
+    id: clientId, page, block, start, end, color: inputColor = 'yellow', note: inputNote = '', scope: inputScope = 'private',
+  } = await readJson(request);
+  const color = presetColors.has(inputColor) ? inputColor : hexColor(inputColor);
   if (![page, block, start, end].every((number) => Number.isSafeInteger(number) && number >= 0)
-      || page >= 2_000 || block >= 1_000 || start >= end || end - start > 10_000 || !colors.has(color)) {
+      || page >= 2_000 || block >= 1_000 || start >= end || end - start > 10_000 || !color) {
     throw new HttpError(400, 'Seleção de texto inválida.');
   }
   if (clientId !== undefined && (typeof clientId !== 'string' || !uuidPattern.test(clientId))) {
     throw new HttpError(400, 'Identificador de destaque inválido.');
   }
+  const id = clientId?.toLowerCase() ?? randomUUID();
+  const note = highlightNote(inputNote);
+  const scope = highlightScope(inputScope);
 
   const highlight = await storage.transaction(async (connection) => {
     const row = await getBookBlock(connection, page, block, bookId, userId);
@@ -414,22 +494,45 @@ async function saveHighlight(request, response, bookId, userId) {
     const text = cleanText(target.text.slice(start, end));
     if (!text.trim()) throw new HttpError(400, 'Selecione uma palavra ou frase.');
 
-    const id = clientId?.toLowerCase() ?? randomUUID();
+    const existing = clientId ? await connection.get(highlightByIdSql, id, bookId) : null;
+    if (existing) {
+      if (existing.page === page && existing.block === block && existing.start === start && existing.end === end
+          && existing.text === text && existing.color === color && existing.note === note && existing.scope === scope) return existing;
+      throw new HttpError(409, 'Não foi possível usar este identificador de destaque.');
+    }
+
+    if (scope === 'group') await verifyHighlightSharing(connection, bookId, userId);
     const createdAt = new Date().toISOString();
     const inserted = await connection.run(`
       INSERT INTO highlights VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (id) DO NOTHING
     `, id, bookId, page, block, start, end, text, color, createdAt);
-    if (inserted.changes) return { id, page, block, start, end, text, color, createdAt };
-
-    const existing = await connection.get(
-      `SELECT ${highlightFields} FROM highlights WHERE id = ? AND book_id = ?`, id, bookId,
-    );
-    if (existing?.page === page && existing.block === block && existing.start === start
-        && existing.end === end && existing.text === text && existing.color === color) return existing;
-    throw new HttpError(409, 'Não foi possível usar este identificador de destaque.');
+    if (!inserted.changes) throw new HttpError(409, 'Não foi possível usar este identificador de destaque.');
+    await writeHighlightDetails(connection, id, note, scope);
+    return { id, page, block, start, end, text, color, createdAt, note, scope };
   });
   respondJson(response, 201, { highlight });
+}
+
+async function editHighlight(request, response, bookId, highlightId, userId) {
+  const { note: inputNote, scope: inputScope } = await readJson(request);
+  if (inputNote === undefined && inputScope === undefined) {
+    throw new HttpError(400, 'Informe uma observação ou visibilidade para o destaque.');
+  }
+  const requestedNote = inputNote === undefined ? undefined : highlightNote(inputNote);
+  const requestedScope = inputScope === undefined ? undefined : highlightScope(inputScope);
+  const highlight = await storage.transaction(async (connection) => {
+    // Use the same book row lock as creation to serialize updates and client retries.
+    const book = await connection.get(`SELECT id FROM books WHERE id = ? AND owner_id = ?${storage.forUpdate}`, bookId, userId);
+    const existing = book ? await connection.get(editableHighlightSql, highlightId, bookId) : null;
+    if (!existing) throw new HttpError(404, 'Destaque não encontrado.');
+    const note = requestedNote ?? existing.note;
+    const scope = requestedScope ?? existing.scope;
+    if (scope === 'group' && existing.scope !== 'group') await verifyHighlightSharing(connection, bookId, userId);
+    await writeHighlightDetails(connection, highlightId, note, scope);
+    return { ...existing, note, scope };
+  });
+  respondJson(response, 200, { highlight });
 }
 
 function importNotFound() {
@@ -614,6 +717,8 @@ async function handleApi(request, response, pathname, searchParams, hosted) {
   const user = await activeUser(request);
   if (!user) throw new HttpError(401, 'Entre na sua conta para continuar.');
 
+  if (pathname.startsWith('/api/social') && await social.handle(request, response, pathname, searchParams, user)) return;
+
   if (pathname === '/api/highlights' && method === 'GET') {
     const { rows, nextOffset } = await listRows(listAccountHighlightsSql, user.id, searchParams, highlightBatchSize, hosted);
     const groups = new Map();
@@ -622,6 +727,12 @@ async function handleApi(request, response, pathname, searchParams, hosted) {
       groups.get(bookId).highlights.push(highlight);
     }
     return respondJson(response, 200, { books: [...groups.values()], nextOffset });
+  }
+  if (pathname === '/api/reader/colors' && method === 'GET') {
+    return readerColors(response, user.id);
+  }
+  if (pathname === '/api/reader/colors' && method === 'POST') {
+    return saveReaderColor(request, response, user.id);
   }
 
   if (pathname === '/api/books') {
@@ -697,6 +808,9 @@ async function handleApi(request, response, pathname, searchParams, hosted) {
   }
   if (resource === 'highlights' && !highlightId && method === 'POST') {
     return saveHighlight(request, response, bookId, user.id);
+  }
+  if (resource === 'highlights' && highlightId && method === 'PATCH') {
+    return editHighlight(request, response, bookId, highlightId, user.id);
   }
   if (resource === 'highlights' && highlightId && method === 'DELETE') {
     if ((await queries.deleteHighlight.run(highlightId, bookId, user.id)).changes === 0) {

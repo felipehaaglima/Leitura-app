@@ -2,7 +2,7 @@ import './style.css'
 import { createImportManager } from './import-jobs.js'
 import {
   addPendingHighlight, clearPendingReading, pendingReading, removePendingHighlight,
-  savePendingPosition, syncPendingReading,
+  savePendingPosition, syncPendingReading, updatePendingHighlight,
 } from './pending-reading.js'
 import { sampleBooks } from './samples.js'
 
@@ -16,6 +16,7 @@ const icons = {
   library: '<path d="M4 19V5m4 14V5m4 14V5m4 1 4 13"/>',
   bookmark: '<path d="M6 5a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v15l-6-4-6 4z"/>',
   user: '<circle cx="12" cy="8" r="3"/><path d="M5 20v-2a4 4 0 0 1 4-4h6a4 4 0 0 1 4 4v2"/>',
+  social: '<circle cx="9" cy="8" r="3"/><path d="M3 20v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2m2-15a3 3 0 0 1 0 6m5 9v-2a4 4 0 0 0-4-4"/>',
   upload: '<path d="M12 15V4m-4 4 4-4 4 4M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/>',
   search: '<circle cx="11" cy="11" r="6"/><path d="m16 16 4 4"/>',
   close: '<path d="m6 6 12 12M18 6 6 18"/>',
@@ -32,12 +33,15 @@ const normalized = value => value.normalize('NFD').replace(/\p{Diacritic}/gu, ''
 
 let user = null
 let books = []
+let booksVersion = 0
+let highlightPalette = []
 let section = 'library'
 let filter = 'all'
 let query = ''
 let readerCleanup
 let readerBook
 let readerSession
+let socialCleanup
 let readerRequest = 0
 let openingBook
 let toastTimeout
@@ -190,7 +194,7 @@ function bookCard(book) {
     <div class="book-cover ${imported ? 'cover-imported' : `cover-${book.id}`}">${cover}</div>
     <div class="book-caption">
       <h3>${escape(book.title)}</h3>
-      <p>${escape(book.author ?? 'PDF importado')}</p>
+      <p>${book.recommendedBy?.name ? `Indicado por ${escape(book.recommendedBy.name)}` : escape(book.author ?? 'PDF importado')}</p>
       <span class="book-genre">${escape(book.genre ?? `${book.pageCount} páginas`)}</span>
     </div>
     ${book.currentPage > 0 ? `<span class="book-progress" aria-label="Página ${book.currentPage + 1} de ${book.pageCount}"><span style="width: ${(book.currentPage + 1) / book.pageCount * 100}%"></span></span>` : ''}
@@ -260,8 +264,8 @@ async function renderHighlights() {
     results.innerHTML = markedBooks.length
       ? markedBooks.map(book => `<section class="highlight-group"><h2>${escape(book.title)}</h2>${
         book.highlights.map(mark => `<button type="button" class="highlight-entry" data-book="${escape(book.id)}" data-page="${mark.page}" data-block="${mark.block}" data-offset="${mark.start}">
-          <span class="swatch swatch-${escape(mark.color || 'yellow')}"></span>
-          <span><q>${escape(mark.text)}</q><small>Página ${mark.page + 1}</small></span>${icon('chevron')}
+          <span class="swatch swatch-${escape(mark.color || 'yellow')}"${/^#[0-9a-f]{6}$/i.test(mark.color) ? ` style="background-color:${mark.color}"` : ''}></span>
+          <span><q>${escape(mark.text)}</q>${mark.note ? `<span class="highlight-note">${escape(mark.note)}</span>` : ''}<small>Página ${mark.page + 1}${mark.scope === 'group' ? ' · Grupo' : ''}</small></span>${icon('chevron')}
         </button>`).join('')
       }</section>`).join('')
       : `<div class="empty">${icon('bookmark')}<h3>Seus destaques aparecem aqui</h3><p>Selecione um trecho durante a leitura para guardá-lo.</p>
@@ -273,12 +277,15 @@ async function renderHighlights() {
 
 function renderShell() {
   themeColor?.setAttribute('content', '#f8f6ef')
+  socialCleanup?.()
+  socialCleanup = undefined
   readerCleanup?.()
   readerCleanup = undefined
   readerBook = undefined
   readerSession = undefined
   document.title = 'Margem — Biblioteca de leitura'
   const active = name => section === name ? 'aria-current="page"' : ''
+  const [sectionIcon, sectionName] = { library: ['library', 'Biblioteca'], highlights: ['bookmark', 'Destaques'], social: ['social', 'Social'] }[section]
   app.innerHTML = `<div class="shell">
     <aside class="sidebar">
       <button class="brand" type="button" data-section="library" aria-label="Margem — biblioteca">
@@ -289,6 +296,7 @@ function renderShell() {
         <nav aria-label="Navegação principal">
           <button type="button" data-section="library" ${active('library')}>${icon('library')} Biblioteca</button>
           <button type="button" data-section="highlights" ${active('highlights')}>${icon('bookmark')} Destaques</button>
+          <button type="button" data-section="social" ${active('social')}>${icon('social')} Social</button>
         </nav>
       </div>
       <div class="sidebar-bottom">
@@ -301,7 +309,7 @@ function renderShell() {
       </div>
     </aside>
     <main class="main-area">
-      <header class="topbar"><p>${icon(section === 'library' ? 'library' : 'bookmark')} ${section === 'library' ? 'Biblioteca' : 'Destaques'}</p>
+      <header class="topbar"><p>${icon(sectionIcon)} ${sectionName}</p>
         <button class="button topbar-upload" type="button" data-action="upload">${icon('upload')} Importar PDF</button></header>
       <div id="import-summary" class="import-summary" hidden>
         <div class="import-summary-actions">
@@ -312,7 +320,7 @@ function renderShell() {
           <button class="button secondary" type="button" data-action="read-import-preview" hidden>${icon('library')} Ler páginas disponíveis</button>
         </div>
       </div>
-      ${section === 'library' ? libraryView() : `<div class="page-content highlights-page">
+      ${section === 'library' ? libraryView() : section === 'social' ? '<div id="social-view"></div>' : `<div class="page-content highlights-page">
         <div class="page-intro"><h1>Seus destaques</h1><p>Volte aos trechos que você marcou.</p></div>
         <div id="highlight-results" aria-live="polite"><p>Carregando destaques…</p></div>
       </div>`}
@@ -321,6 +329,24 @@ function renderShell() {
   updateImportProgress(imports.current)
   if (section === 'library') renderBookList()
   if (section === 'highlights') void renderHighlights()
+  if (section === 'social') void mountSocial()
+}
+
+async function mountSocial() {
+  const target = document.querySelector('#social-view')
+  try {
+    const { renderSocial } = await import('./social-view.js')
+    if (target.isConnected) {
+      socialCleanup = renderSocial(target, {
+        user, api,
+        onSignIn: () => showAuth(),
+        onBook: id => void openBook(id),
+        onLibraryChanged: refreshBooks,
+      })
+    }
+  } catch (error) {
+    if (target.isConnected) target.textContent = error.message
+  }
 }
 
 function showDialog(title, contents, view = '') {
@@ -356,6 +382,7 @@ function showAuth(mode = 'login', after) {
     try {
       const data = Object.fromEntries(new FormData(form))
       user = (await api(register ? '/register' : '/login', { method: 'POST', data })).user
+      void refreshPalette(user.id)
       try { await refreshBooks() } catch (failure) { announce(failure.message) }
       await setupImports()
       dialog.close()
@@ -493,7 +520,7 @@ function finishUpload({ id, book, fallbackPages }, accountId) {
   const draft = pendingReading(accountId, completedId)
   const sync = syncPendingReading(api, accountId, completedId).catch(error => announce(error.message))
   if (book) {
-    books = [book, ...books.filter(item => item.id !== book.id)]
+    setBooks([book, ...books.filter(item => item.id !== book.id)])
     renderBookList()
   }
   if (liveReader && readerSession === liveReader) {
@@ -556,7 +583,7 @@ function showDeleteBook(id) {
       await api(`/books/${id}`, { method: 'DELETE' }).catch(failure => {
         if (failure.status !== 404) throw failure
       })
-      books = books.filter(item => item.id !== id)
+      setBooks(books.filter(item => item.id !== id))
       clearPendingReading(account, id)
       if (dialog.open && dialog.contains(form)) dialog.close()
       renderBookList()
@@ -574,10 +601,89 @@ function showDeleteBook(id) {
   }
 }
 
+function setBooks(result) {
+  booksVersion++
+  books = result
+}
+
 async function refreshBooks() {
   const account = user?.id
+  const version = ++booksVersion
   const result = account ? await listAll('/books', 'books') : []
-  if (account === user?.id) books = result
+  if (account === user?.id && version === booksVersion) books = result
+}
+
+async function refreshVisibleLibrary() {
+  if (!user || readerBook || section !== 'library' || !document.querySelector('#book-list')) return
+  try {
+    await refreshBooks()
+    renderBookList()
+  } catch (error) {
+    if (section === 'library' && !readerBook) announce(error.message)
+  }
+}
+
+async function refreshPalette(account) {
+  try {
+    const { colors } = await api('/reader/colors')
+    if (user?.id === account) {
+      highlightPalette = [...new Set([...colors, ...highlightPalette])]
+      readerCleanup?.updateBook({ palette: highlightPalette })
+    }
+  } catch {
+    // The preset colors remain available while the account palette is unavailable.
+  }
+}
+
+function routedBook() {
+  return /^#livro=([a-z0-9-]{1,64})$/i.exec(window.location.hash)?.[1]
+}
+
+function recordReaderRoute(id) {
+  const url = new URL(window.location.href)
+  if (routedBook() && !history.state?.margemBook) {
+    url.hash = ''
+    history.replaceState(null, '', url)
+  }
+  if (history.state?.margemBook === id) return
+  url.hash = `livro=${id}`
+  if (history.state?.margemBook) history.replaceState({ margemBook: id }, '', url)
+  else history.pushState({ margemBook: id }, '', url)
+}
+
+function showLibraryHome() {
+  readerRequest++
+  openingBook?.abort()
+  if (dialog.open) dialog.close()
+  section = 'library'
+  renderShell()
+  void refreshVisibleLibrary()
+  window.scrollTo(0, 0)
+}
+
+function exitReader() {
+  if (history.state?.margemBook && routedBook()) history.back()
+  else showLibraryHome()
+}
+
+function openCurrentRoute() {
+  const id = routedBook()
+  if (!id) return
+  if (user || sampleBooks.some(book => book.id === id)) void openBook(id)
+  else showAuth('login', () => { if (routedBook() === id) void openBook(id) })
+}
+
+async function loadReadingGroup(id, page, signal) {
+  const path = `/social/books/${id}/group?page=${page}`
+  const group = await readRequest(path, signal)
+  let offset = group.nextOffset
+  while (offset != null) {
+    const batch = await readRequest(`${path}&offset=${offset}`, signal)
+    if (batch.status !== 'active') return batch
+    group.highlights.push(...batch.highlights)
+    offset = batch.nextOffset
+  }
+  return group
 }
 
 function readAvailablePages() {
@@ -671,21 +777,34 @@ async function openBook(id, explicitPage, explicitAnchor) {
       }
       await syncPendingReading(api, account, id).catch(() => {})
       await api(`/books/${id}/progress`, { method: 'PATCH', data: { page, anchor: nextAnchor } })
-      books = books.map(item => item.id === id ? { ...item, currentPage: page, anchor: nextAnchor } : item)
+      setBooks(books.map(item => item.id === id ? { ...item, currentPage: page, anchor: nextAnchor } : item))
       if (!readerBook) renderBookList()
     }
 
     readerCleanup?.()
+    socialCleanup?.()
+    socialCleanup = undefined
     readerSession = session
     readerBook = { ...book, position, anchor, highlights }
     document.title = `${book.title} — Margem`
     readerCleanup = reader.renderReader(app, {
       book: readerBook,
       loadPage: book.loadPage,
-      onExit: () => {
-        renderShell()
-        window.scrollTo(0, 0)
-      },
+      onExit: exitReader,
+      palette: highlightPalette,
+      viewerId: account,
+      onAddColor: account ? async color => {
+        const { colors } = await api('/reader/colors', { method: 'POST', data: { color } })
+        if (user?.id === account) highlightPalette = [...new Set([...colors, ...highlightPalette])]
+        return colors
+      } : undefined,
+      onLoadGroup: !sample && account ? (page, groupSignal) => (
+        session.preview || user?.id !== account
+          ? Promise.resolve({ status: 'unavailable', members: [], highlights: [] })
+          : loadReadingGroup(id, page, groupSignal)
+      ) : undefined,
+      onStartGroup: !sample && account ? () => api(`/social/books/${id}/group`, { method: 'POST', data: {} }) : undefined,
+      onRespondGroup: !sample && account ? (groupId, accept) => api(`/social/groups/${groupId}`, { method: 'PATCH', data: { accept } }) : undefined,
       onPosition: savePosition,
       onAddHighlight: async data => {
         if (sample) {
@@ -696,7 +815,21 @@ async function openBook(id, explicitPage, explicitAnchor) {
         }
         if (session.preview) return addPendingHighlight(account, id, data)
         const { highlight } = await api(`/books/${id}/highlights`, { method: 'POST', data })
-        books = books.map(item => item.id === id ? { ...item, highlightCount: (item.highlightCount ?? 0) + 1 } : item)
+        setBooks(books.map(item => item.id === id ? { ...item, highlightCount: (item.highlightCount ?? 0) + 1 } : item))
+        return highlight
+      },
+      onUpdateHighlight: async (highlightId, changes) => {
+        if (sample) {
+          const index = sampleProgress.highlights.findIndex(mark => mark.id === highlightId)
+          if (index === -1) throw new Error('Destaque não encontrado.')
+          const highlight = { ...sampleProgress.highlights[index], ...changes }
+          sampleProgress.highlights[index] = highlight
+          storeSample(sample, sampleProgress, account)
+          return highlight
+        }
+        if (session.preview) return updatePendingHighlight(account, id, highlightId, changes)
+        await syncPendingReading(api, account, id).catch(() => {})
+        const { highlight } = await api(`/books/${id}/highlights/${highlightId}`, { method: 'PATCH', data: changes })
         return highlight
       },
       onRemoveHighlight: async highlightId => {
@@ -714,9 +847,10 @@ async function openBook(id, explicitPage, explicitAnchor) {
           if (error.status !== 404) throw error
         })
         removePendingHighlight(account, id, highlightId)
-        books = books.map(item => item.id === id ? { ...item, highlightCount: Math.max(0, (item.highlightCount ?? 1) - 1) } : item)
+        setBooks(books.map(item => item.id === id ? { ...item, highlightCount: Math.max(0, (item.highlightCount ?? 1) - 1) } : item))
       },
     })
+    recordReaderRoute(id)
     if (openingBook === controller) openingBook = undefined
     if (dialog.open && dialog.dataset.view === 'open-book') dialog.close()
     themeColor?.setAttribute('content', '#ffffff')
@@ -759,6 +893,7 @@ app.addEventListener('click', event => {
     readerRequest++
     section = targetSection
     renderShell()
+    if (section === 'library') void refreshVisibleLibrary()
   }
   if (targetFilter) {
     filter = targetFilter
@@ -776,6 +911,17 @@ app.addEventListener('input', event => {
 dialog.addEventListener('cancel', () => {
   if (dialog.dataset.view === 'open-book') openingBook?.abort()
 })
+
+window.addEventListener('popstate', () => {
+  if (routedBook()) {
+    if (dialog.open) dialog.close()
+    openCurrentRoute()
+  } else {
+    showLibraryHome()
+  }
+})
+
+window.addEventListener('focus', () => void refreshVisibleLibrary())
 
 dialog.addEventListener('click', async event => {
   const button = event.target.closest('button')
@@ -820,7 +966,8 @@ dialog.addEventListener('click', async event => {
     await imports.setAccount(null)
     await api('/logout', { method: 'POST' })
     user = null
-    books = []
+    setBooks([])
+    highlightPalette = []
     dialog.close()
     renderShell()
   } catch (error) {
@@ -834,9 +981,11 @@ dialog.addEventListener('click', async event => {
 renderShell()
 try {
   user = (await api('/session')).user
+  if (user) void refreshPalette(user.id)
   try { await refreshBooks() } catch (error) { announce(error.message) }
   if (user && !readerBook) renderShell()
   await setupImports()
+  openCurrentRoute()
 } catch (error) {
   announce(error.message)
 }

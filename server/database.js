@@ -49,6 +49,68 @@ const schema = `
   ) TABLE_OPTION;
   CREATE INDEX IF NOT EXISTS highlights_book ON highlights(book_id, page, block);
 
+  CREATE TABLE IF NOT EXISTS highlight_details (
+    highlight_id TEXT PRIMARY KEY REFERENCES highlights(id) ON DELETE CASCADE,
+    note TEXT NOT NULL DEFAULT '',
+    scope TEXT NOT NULL DEFAULT 'private' CHECK (scope IN ('private', 'group'))
+  ) TABLE_OPTION;
+
+  CREATE TABLE IF NOT EXISTS reader_colors (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    color TEXT NOT NULL,
+    created_at TIME_TYPE NOT NULL,
+    PRIMARY KEY (user_id, color)
+  ) TABLE_OPTION;
+
+  CREATE TABLE IF NOT EXISTS social_friendships (
+    id TEXT PRIMARY KEY,
+    left_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    right_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    requested_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'accepted')),
+    UNIQUE (left_user_id, right_user_id),
+    CHECK (left_user_id <> right_user_id AND requested_by IN (left_user_id, right_user_id))
+  ) TABLE_OPTION;
+  CREATE INDEX IF NOT EXISTS social_friendships_right ON social_friendships(right_user_id);
+
+  CREATE TABLE IF NOT EXISTS book_origins (
+    book_id TEXT PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+    circle_id TEXT NOT NULL,
+    from_user_id TEXT REFERENCES users(id) ON DELETE SET NULL
+  ) TABLE_OPTION;
+  CREATE INDEX IF NOT EXISTS book_origins_circle ON book_origins(circle_id);
+
+  CREATE TABLE IF NOT EXISTS social_share_requests (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    requester_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'accepted')),
+    copy_id TEXT REFERENCES books(id) ON DELETE SET NULL,
+    UNIQUE (book_id, requester_id),
+    CHECK (owner_id <> requester_id)
+  ) TABLE_OPTION;
+  CREATE INDEX IF NOT EXISTS social_share_requests_owner ON social_share_requests(owner_id);
+  CREATE INDEX IF NOT EXISTS social_share_requests_requester ON social_share_requests(requester_id);
+  CREATE INDEX IF NOT EXISTS social_share_requests_copy ON social_share_requests(copy_id);
+
+  CREATE TABLE IF NOT EXISTS reading_groups (
+    id TEXT PRIMARY KEY,
+    circle_id TEXT NOT NULL UNIQUE,
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL
+  ) TABLE_OPTION;
+
+  CREATE TABLE IF NOT EXISTS reading_group_members (
+    group_id TEXT NOT NULL REFERENCES reading_groups(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    invited_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    status TEXT NOT NULL CHECK (status IN ('invited', 'active', 'declined', 'left')),
+    PRIMARY KEY (group_id, user_id)
+  ) TABLE_OPTION;
+  CREATE INDEX IF NOT EXISTS reading_group_members_user ON reading_group_members(user_id);
+  CREATE INDEX IF NOT EXISTS reading_group_members_book ON reading_group_members(book_id);
+
   CREATE TABLE IF NOT EXISTS imports (
     id TEXT PRIMARY KEY,
     owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
