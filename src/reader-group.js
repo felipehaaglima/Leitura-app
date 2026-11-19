@@ -28,7 +28,7 @@ function hasPosition(member) {
 
 export function installReaderGroup({
   button, body, leftRail, rightRail, signal, viewerId, getPage, loadGroup,
-  startGroup, respondGroup, comparePeer, onChange, onJump, announce,
+  startGroup, respondGroup, comparePeer, onChange, onJump, onOpenHighlight, announce,
 }) {
   let loader = loadGroup;
   let group;
@@ -129,6 +129,11 @@ export function installReaderGroup({
       jump.addEventListener("click", () => onJump(mark));
       item.append(jump);
       if (mark.note) item.append(textElement("p", "lr-group-note", mark.note));
+      if (onOpenHighlight) {
+        const notes = actionButton("lr-group-view-notes", "Ver notas", (event) => onOpenHighlight(mark, event.currentTarget));
+        notes.dataset.groupFocus = `notes-${mark.id}`;
+        item.append(notes);
+      }
       list.append(item);
     }
     body.append(list);

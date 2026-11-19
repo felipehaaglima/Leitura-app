@@ -77,9 +77,14 @@ export function syncPendingReading(api, account, id) {
       for (const key of highlightKeys(account, id)) {
         const highlight = read(key)
         if (!highlight) continue
-        const { id: markId, page, block, start, end, color, note, scope } = highlight
-        await api(`/books/${id}/highlights`, { method: 'POST', data: { id: markId, page, block, start, end, color, note, scope } })
-        localStorage.removeItem(key)
+        const { id: markId, page, block, start, end, color, note, scope, notes = [] } = highlight
+        const path = `/books/${id}/highlights`
+        await api(path, { method: 'POST', data: { id: markId, page, block, start, end, color, note, scope } })
+        for (const entry of notes) {
+          const data = { id: entry.id, text: entry.text, scope: entry.scope, mentions: [] }
+          await api(`${path}/${markId}/notes`, { method: 'POST', data })
+        }
+        if (localStorage.getItem(key) === JSON.stringify(highlight)) localStorage.removeItem(key)
       }
     })().finally(() => syncing.delete(start))
     syncing.set(start, task)

@@ -50,6 +50,20 @@ function friendRow(friend) {
   </li>`
 }
 
+function mentionRow(mention) {
+  const author = mention.author?.name || 'Leitor'
+  return `<li>
+    <button type="button" class="social-mention" data-social-action="open-mention" data-id="${escape(mention.id)}">
+      ${avatar(author)}
+      <span class="social-mention-body">
+        <strong>${escape(mention.title)}</strong>
+        <span class="social-mention-source">${escape(author)} mencionou você · Página ${escape(mention.page + 1)}</span>
+        <q>${escape(mention.text)}</q>
+      </span>
+    </button>
+  </li>`
+}
+
 function requestRow(kind, request, busy) {
   const group = kind === 'groups'
   const share = kind === 'shares'
@@ -111,6 +125,7 @@ export function renderSocial(root, { user, api, onSignIn, onBook, onLibraryChang
   <p class="social-feedback social-feedback-error" role="alert" data-social-error hidden></p>
   <div data-social-overview>
     ${ownIdentity(user.id)}
+    <section class="social-panel social-mentions" data-social-mentions aria-labelledby="social-mentions-title" hidden></section>
     <div class="social-board" data-social-board aria-busy="true">
       <p class="social-empty">Carregando amigos e pedidos…</p>
     </div>
@@ -140,9 +155,13 @@ export function renderSocial(root, { user, api, onSignIn, onBook, onLibraryChang
   const profileBooks = find('[data-social-books]')
   const refresh = find('[data-social-action=refresh]')
   const overviewPane = find('[data-social-overview]')
+  const mentionsPane = find('[data-social-mentions]')
   let overview
   let friend
   let profile
+  let mentionPage
+  let mentionsLoading = false
+  let mentionsFailed = false
   let overviewLoading = false
   let overviewQueued = false
   let profileLoading = false
@@ -180,6 +199,66 @@ export function renderSocial(root, { user, api, onSignIn, onBook, onLibraryChang
       <h2>Pedidos e convites</h2>
       ${groups || '<p class="social-empty">Você não tem pedidos nem convites pendentes.</p>'}
     </section>`
+  }
+
+  function renderMentions() {
+    const mentions = mentionPage?.mentions ?? []
+    mentionsPane.hidden = !mentions.length
+    mentionsPane.setAttribute('aria-busy', String(mentionsLoading))
+    mentionsPane.innerHTML = mentions.length ? `
+      <h2 id="social-mentions-title">Menções</h2>
+      <ul class="social-mentions-list">${mentions.map(mentionRow).join('')}</ul>
+      ${mentionsFailed ? '<p class="social-empty" role="status">Não foi possível atualizar as menções.</p>' : ''}
+      ${mentionPage.nextOffset != null ? action('more-mentions', 'Carregar mais', { disabled: mentionsLoading }) : ''}`
+      : ''
+  }
+
+  async function loadMentions(append = false) {
+    if (signal.aborted || mentionsLoading || (append && mentionPage?.nextOffset == null)) return
+    const offset = append ? mentionPage.nextOffset : 0
+    const more = mentionsPane.querySelector('[data-social-action=more-mentions]')
+    const restoreFocus = append && document.activeElement === more
+    mentionsLoading = true
+    mentionsPane.setAttribute('aria-busy', 'true')
+    if (more) more.disabled = true
+    try {
+      const result = await apiRequest(`/reader/mentions?offset=${encodeURIComponent(offset)}`)
+      if (signal.aborted) return
+      const previous = append ? mentionPage.mentions : []
+      const known = new Set(previous.map(mention => mention.id))
+      mentionPage = {
+        mentions: [...previous, ...result.mentions.filter(mention => !known.has(mention.id))],
+        nextOffset: result.nextOffset,
+      }
+      mentionsFailed = false
+    } catch {
+      mentionsFailed = true
+    } finally {
+      mentionsLoading = false
+      if (!signal.aborted) {
+        const keepFocus = restoreFocus && (document.activeElement === more || document.activeElement === document.body)
+        renderMentions()
+        if (keepFocus) {
+          const nextControl = mentionsPane.querySelector('[data-social-action=more-mentions]') ??
+            mentionsPane.querySelector('li:last-child button')
+          nextControl?.focus({ preventScroll: true })
+        }
+      }
+    }
+  }
+
+  async function openMention(id, button) {
+    const mention = mentionPage?.mentions.find(item => item.id === id)
+    if (!mention) return
+    button.disabled = true
+    showError()
+    try {
+      await onBook(mention.bookId, mention.page, { block: mention.block, offset: mention.start }, mention.highlightId)
+    } catch (error) {
+      if (!signal.aborted) showError(error)
+    } finally {
+      if (!signal.aborted) button.disabled = false
+    }
   }
 
   async function loadOverview({ clearError = false } = {}) {
@@ -383,7 +462,10 @@ export function renderSocial(root, { user, api, onSignIn, onBook, onLibraryChang
     const { socialAction, id } = button.dataset
     if (socialAction === 'refresh') {
       if (friend) void loadProfile()
-      else void loadOverview({ clearError: true })
+      else {
+        void loadOverview({ clearError: true })
+        void loadMentions()
+      }
     } else if (socialAction === 'copy-id') {
       void copyIdentity()
     } else if (socialAction === 'profile') {
@@ -392,6 +474,10 @@ export function renderSocial(root, { user, api, onSignIn, onBook, onLibraryChang
       back()
     } else if (socialAction === 'more') {
       void loadProfile(true)
+    } else if (socialAction === 'more-mentions') {
+      void loadMentions(true)
+    } else if (socialAction === 'open-mention') {
+      void openMention(id, button)
     } else if (socialAction === 'request-copy') {
       const target = friend?.id
       void mutate(`copy:${id}`, button, '/social/shares', {
@@ -413,5 +499,6 @@ export function renderSocial(root, { user, api, onSignIn, onBook, onLibraryChang
   }, { signal })
 
   void loadOverview()
+  void loadMentions()
   return cleanup
 }

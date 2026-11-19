@@ -55,6 +55,23 @@ const schema = `
     scope TEXT NOT NULL DEFAULT 'private' CHECK (scope IN ('private', 'group'))
   ) TABLE_OPTION;
 
+  CREATE TABLE IF NOT EXISTS highlight_notes (
+    id TEXT PRIMARY KEY,
+    highlight_id TEXT NOT NULL REFERENCES highlights(id) ON DELETE CASCADE,
+    text TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK (scope IN ('private', 'group')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) TABLE_OPTION;
+  CREATE INDEX IF NOT EXISTS highlight_notes_highlight ON highlight_notes(highlight_id, created_at, id);
+
+  CREATE TABLE IF NOT EXISTS highlight_note_mentions (
+    note_id TEXT NOT NULL REFERENCES highlight_notes(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY (note_id, user_id)
+  ) TABLE_OPTION;
+  CREATE INDEX IF NOT EXISTS highlight_note_mentions_user ON highlight_note_mentions(user_id, note_id);
+
   CREATE TABLE IF NOT EXISTS reader_colors (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     color TEXT NOT NULL,

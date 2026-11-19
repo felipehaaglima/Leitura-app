@@ -4,6 +4,7 @@ import { paginatePage } from "./pagination.js";
 import { installReaderTouch } from "./reader-touch.js";
 import { applyReaderColor, colorLabel, normalizePalette, tones } from "./reader-colors.js";
 import { installReaderGroup } from "./reader-group.js";
+import { installHighlightPanel } from "./highlight-panel.js";
 
 const icons = {
   library: '<path d="M3 4h3v16H3zM9 4h3v16H9zM15 5l3-1 4 15-3 1z" />',
@@ -14,7 +15,6 @@ const icons = {
   dictionary: '<path d="M12 6a8 8 0 0 0-9-2v14a8 8 0 0 1 9 2 8 8 0 0 1 9-2V4a8 8 0 0 0-9 2Zm0 0v14" />',
   translate: '<path d="M3 5h11M8.5 3v2m2.8 0c-.5 4.5-3.4 7.4-7.8 9.5m2.1-6.2c1.1 2 2.8 3.9 5 5.2M12 21l4.5-10L21 21m-7.6-3h6.2" />',
   close: '<path d="m6 6 12 12M18 6 6 18" />',
-  trash: '<path d="M4 7h16m-14 0 1 13h10l1-13M9 7V4h6v3m-5 3v6m4-6v6" />',
   group: '<circle cx="9" cy="8" r="3"/><path d="M3 20v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2M16 5a3 3 0 0 1 0 6m2 3a4 4 0 0 1 3 4v2"/>',
   note: '<path d="m13 19 7-7V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h7v-6a1 1 0 0 1 1-1h6M8 8h8m-8 4h1"/>',
 };
@@ -39,7 +39,7 @@ function readPreferences() {
   }
 }
 
-function showAnnotations(container, text, annotations) {
+function showAnnotations(container, text, annotations, focusableHighlights) {
   const cuts = new Set([0, text.length]);
   const valid = annotations.filter(({ start, end }) =>
     Number.isInteger(start) && Number.isInteger(end) && start >= 0 && end > start && end <= text.length,
@@ -58,7 +58,13 @@ function showAnnotations(container, text, annotations) {
     if (annotation) {
       const mark = document.createElement("mark");
       applyReaderColor(mark, annotation.color);
-      const tooltip = [annotation.author?.name, annotation.note].filter(Boolean).join("\n");
+      mark.dataset.highlightId = annotation.id;
+      mark.setAttribute("role", "button");
+      mark.setAttribute("aria-haspopup", "dialog");
+      mark.setAttribute("aria-label", `Ver destaque. ${(annotation.text || text.slice(start, end)).trim().slice(0, 160)}`);
+      mark.tabIndex = focusableHighlights.has(annotation.id) ? -1 : 0;
+      focusableHighlights.add(annotation.id);
+      const tooltip = annotation.author?.name;
       if (tooltip) mark.title = tooltip;
       mark.textContent = text.slice(start, end);
       container.append(mark);
@@ -123,11 +129,13 @@ function partSuffix(index) {
 export function renderReader(root, {
   book, onExit, onPosition, onAddHighlight, onRemoveHighlight, loadPage,
   palette, onAddColor, onUpdateHighlight, viewerId, onLoadGroup, onStartGroup, onRespondGroup,
+  loadNotes, addNote, updateNote, deleteNote, initialHighlightId,
 }) {
   let pages = book.pages ?? [];
   let knownCount = book.pageCount;
   let loading = book.loading ?? null;
   const initialPage = Number.isInteger(book.position) && book.position >= 0 ? book.position : 0;
+  let pendingHighlightId = initialHighlightId;
   let page = pages[initialPage] || (loadPage && initialPage < knownCount)
     ? initialPage : Math.max(0, pages.findIndex(Boolean));
   let anchor = page === initialPage ? book.anchor : undefined;
@@ -142,10 +150,10 @@ export function renderReader(root, {
   const layouts = new Map();
   let highlights = [...(book.highlights ?? [])];
   let customColors = normalizePalette(palette);
-  let selectedScope = "private";
   let peerHighlights = [];
-  let groupActive = false;
+  let groupState = { status: "unavailable", members: [] };
   let groupControls;
+  let highlightPanel;
   let editorDraft;
   const removedHighlights = new Set();
   let highlightRepaintPending = false;
@@ -246,26 +254,18 @@ export function renderReader(root, {
         <a class="lr-selection-action" data-translate target="_blank" rel="noopener noreferrer">${icon("translate")}<span>Traduzir</span></a>
       </div>
       <div id="lr-colors" class="lr-color-options" hidden>
-        <div class="lr-colors"></div>
-        <div class="lr-selection-scope" role="group" aria-label="Visibilidade do destaque" hidden>
-          <button type="button" data-highlight-scope="private" aria-pressed="true">Pessoal</button>
-          <button type="button" data-highlight-scope="group" aria-pressed="false">Grupo</button>
-        </div>
-        <div class="lr-selection-extras">
-          <button type="button" class="lr-add-note" data-note-create hidden>${icon("note")} Adicionar nota</button>
-          <button type="button" class="lr-add-note" data-add-selection-color hidden>Adicionar cor</button>
+        <div class="lr-colors lr-primary-colors"></div>
+        <button type="button" class="lr-more-colors" data-more-colors aria-controls="lr-custom-colors" aria-expanded="false" hidden>Outras cores</button>
+        <div id="lr-custom-colors" hidden>
+          <div class="lr-colors lr-custom-swatches"></div>
+          <button type="button" class="lr-more-colors" data-add-selection-color hidden>Adicionar cor</button>
         </div>
       </div>
     </div>
     <dialog class="lr-editor" aria-labelledby="lr-editor-title">
       <form class="lr-editor-form">
-        <div class="lr-panel-heading"><h2 id="lr-editor-title"></h2><button type="button" class="lr-panel-close" data-editor-close aria-label="Fechar">${icon("close")}</button></div>
-        <label class="lr-color-field" hidden>Escolha uma cor <input name="color" type="color" value="#b9d6ee"></label>
-        <div class="lr-note-fields" hidden>
-          <label class="lr-note-color">Cor do destaque <select name="noteColor"></select></label>
-          <label class="lr-note-scope" hidden>Visibilidade <select name="noteScope"><option value="private">Pessoal</option><option value="group">Grupo</option></select></label>
-          <label for="lr-note">Nota <textarea id="lr-note" name="note" maxlength="2000" rows="5"></textarea></label>
-        </div>
+        <div class="lr-panel-heading"><h2 id="lr-editor-title">Adicionar cor</h2><button type="button" class="lr-panel-close" data-editor-close aria-label="Fechar">${icon("close")}</button></div>
+        <label class="lr-color-field">Escolha uma cor <input name="color" type="color" value="#b9d6ee"></label>
         <p class="lr-editor-error" role="alert" hidden></p>
         <div class="lr-editor-actions">
           <button type="button" data-editor-close>Cancelar</button>
@@ -290,14 +290,12 @@ export function renderReader(root, {
   const selectionMenu = find(".lr-selection");
   const colors = find("#lr-colors");
   const colorToggle = find("[data-highlight-toggle]");
-  const selectionScope = find(".lr-selection-scope");
+  const moreColors = find("[data-more-colors]");
+  const otherColors = find("#lr-custom-colors");
   const editor = find(".lr-editor");
   const editorForm = find(".lr-editor-form");
   const editorError = find(".lr-editor-error");
   const editorSave = find(".lr-editor-save");
-  const note = find("#lr-note");
-  const noteColor = find('[name="noteColor"]');
-  const noteScope = find('[name="noteScope"]');
   const customColor = find('[name="color"]');
 
   displayTitle(book.title);
@@ -380,6 +378,7 @@ export function renderReader(root, {
     selectionData = null;
     selectionMenu.hidden = true;
     colors.hidden = true;
+    showOtherColors(false);
     colorToggle.setAttribute("aria-expanded", "false");
     if (highlightRepaintPending && !hasReadingSelection()) displayPage();
   }
@@ -401,10 +400,9 @@ export function renderReader(root, {
     return [...Object.keys(tones), ...customColors];
   }
 
-  function displayPalette() {
+  function paletteSwatches(values) {
     const swatches = document.createDocumentFragment();
-    const preview = document.createDocumentFragment();
-    for (const color of paletteValues()) {
+    for (const color of values) {
       const label = colorLabel(color);
       const button = document.createElement("button");
       button.type = "button";
@@ -412,7 +410,17 @@ export function renderReader(root, {
       button.setAttribute("aria-label", Object.hasOwn(tones, color) ? `Destacar em ${label.toLowerCase()}` : `Destacar com ${label}`);
       applyReaderColor(button, color);
       swatches.append(button);
+    }
+    return swatches;
+  }
 
+  function displayPalette() {
+    find(".lr-primary-colors").replaceChildren(paletteSwatches(Object.keys(tones)));
+    find(".lr-custom-swatches").replaceChildren(paletteSwatches(customColors));
+    moreColors.hidden = !customColors.length && !onAddColor;
+    const preview = document.createDocumentFragment();
+    for (const color of paletteValues()) {
+      const label = colorLabel(color);
       const sample = document.createElement("span");
       sample.title = label;
       sample.setAttribute("role", "img");
@@ -420,20 +428,15 @@ export function renderReader(root, {
       applyReaderColor(sample, color);
       preview.append(sample);
     }
-    find(".lr-colors").replaceChildren(swatches);
     find(".lr-palette-preview").replaceChildren(preview);
     find("[data-add-color]").hidden = !onAddColor;
     find("[data-add-selection-color]").hidden = !onAddColor;
-    find("[data-note-create]").hidden = !onUpdateHighlight;
     if (!colors.hidden && selectionData) positionSelection(selectionData.rect);
   }
 
-  function displayScope() {
-    selectionScope.hidden = !groupActive;
-    find(".lr-note-scope").hidden = !groupActive;
-    for (const option of selectionScope.querySelectorAll("button")) {
-      option.setAttribute("aria-pressed", String(option.dataset.highlightScope === selectedScope));
-    }
+  function showOtherColors(open) {
+    otherColors.hidden = !open;
+    moreColors.setAttribute("aria-expanded", String(open));
   }
 
   function refreshHighlightPaint() {
@@ -442,13 +445,68 @@ export function renderReader(root, {
   }
 
   function applyGroup(group) {
-    groupActive = group.status === "active";
-    if (!groupActive) selectedScope = "private";
-    displayScope();
-    const next = groupActive ? (group.highlights ?? []).filter((mark) => !viewerId || mark.author?.id !== viewerId) : [];
+    groupState = group;
+    const next = group.status === "active" ? (group.highlights ?? []).filter((mark) => !viewerId || mark.author?.id !== viewerId) : [];
     const changed = JSON.stringify(next) !== JSON.stringify(peerHighlights);
     peerHighlights = next;
     if (changed) refreshHighlightPaint();
+    highlightPanel?.updateGroup();
+    maybeOpenInitialHighlight();
+  }
+
+  function openManagedHighlight(item, trigger) {
+    if (!item || editor.open || highlightPanel?.isOpen) return;
+    pendingHighlightId = null;
+    const own = highlights.find((mark) => mark.id === item.id);
+    const readonly = !own && Boolean(item.author?.id && item.author.id !== viewerId);
+    clearSelection();
+    highlightPanel?.open(own ?? (readonly ? { ...item, scope: "group" } : item), {
+      trigger: trigger instanceof HTMLElement ? trigger : counter,
+      readonly,
+    });
+  }
+
+  function visibleMark(id) {
+    return [...article.querySelectorAll("mark[data-highlight-id]")]
+      .find((mark) => mark.dataset.highlightId === id);
+  }
+
+  function openPaperHighlight(trigger) {
+    const id = trigger.dataset.highlightId;
+    openManagedHighlight(highlights.find((item) => item.id === id) ?? peerHighlights.find((item) => item.id === id), trigger);
+  }
+
+  function maybeOpenInitialHighlight() {
+    if (!pendingHighlightId || !displayed || page !== initialPage || !highlightPanel) return;
+    const item = [...highlights, ...peerHighlights].find((mark) => mark.id === pendingHighlightId && mark.page === page);
+    if (!item) return;
+    pendingHighlightId = null;
+    openManagedHighlight(item, visibleMark(item.id) ?? counter);
+  }
+
+  async function removeManagedHighlight(id) {
+    const previous = highlights.find((mark) => mark.id === id);
+    await onRemoveHighlight(id);
+    if (signal.aborted) return;
+    removedHighlights.add(id);
+    highlights = highlights.filter((mark) => mark.id !== id);
+    if (previous?.page === page) refreshHighlightPaint();
+    displayHighlights();
+    if (previous?.scope === "group") groupControls?.refresh();
+  }
+
+  async function updateManagedHighlight(id, changes) {
+    const previous = highlights.find((mark) => mark.id === id);
+    const result = await onUpdateHighlight(id, changes);
+    const saved = result?.highlight ?? result;
+    if (!saved?.id) throw new Error("Não foi possível atualizar o destaque.");
+    if (signal.aborted) return saved;
+    if (previous) highlights = highlights.map((mark) => mark.id === saved.id ? saved : mark);
+    else highlights.push(saved);
+    if (saved.page === page) refreshHighlightPaint();
+    displayHighlights();
+    if (saved.scope === "group" || previous?.scope === "group") groupControls?.refresh();
+    return saved;
   }
 
   function pageTotal() {
@@ -498,6 +556,8 @@ export function renderReader(root, {
       ...peerHighlights.filter((item) => item.page === page && !removedHighlights.has(item.id)),
       ...highlights.filter((item) => item.page === page),
     ];
+    const focusableHighlights = new Set();
+    const focusedHighlight = article.contains(document.activeElement) ? document.activeElement.dataset.highlightId : null;
 
     for (const slice of parts[part]) {
       const block = displayed?.blocks[slice.block];
@@ -513,7 +573,7 @@ export function renderReader(root, {
             start: Math.max(0, item.start - slice.start),
             end: Math.min(text.length, item.end - slice.start),
           }));
-        showAnnotations(paragraph, text, annotations);
+        showAnnotations(paragraph, text, annotations, focusableHighlights);
         blocks.append(paragraph);
       }
       if (block?.type === "image") {
@@ -537,9 +597,11 @@ export function renderReader(root, {
     }
 
     article.replaceChildren(blocks);
+    if (focusedHighlight) visibleMark(focusedHighlight)?.focus({ preventScroll: true });
     const partLabel = parts.length > 1 ? `, parte ${part + 1} de ${parts.length}` : "";
     article.setAttribute("aria-label", displayed ? `Página ${page + 1}${partLabel}` : "Página de leitura");
     displayNavigation();
+    maybeOpenInitialHighlight();
   }
 
   function layoutFor(index, source) {
@@ -584,6 +646,7 @@ export function renderReader(root, {
   }
 
   async function goTo(index, destination, { last = false, persist = true } = {}) {
+    if (persist) pendingHighlightId = null;
     if (!canOpen(index)) {
       const total = pageTotal();
       if (persist && index >= 0 && (total === null || index < total)) {
@@ -686,78 +749,37 @@ export function renderReader(root, {
         showPanel(null, true);
       });
 
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "lr-remove-highlight";
-      remove.setAttribute("aria-label", `Remover destaque na página ${item.page + 1}`);
-      remove.innerHTML = icon("trash");
-      remove.addEventListener("click", async () => {
-        remove.disabled = true;
-        try {
-          await onRemoveHighlight(item.id);
-          if (signal.aborted) return;
-          removedHighlights.add(item.id);
-          highlights = highlights.filter((highlight) => highlight.id !== item.id);
-          clearSelection();
-          displayPage();
-          displayHighlights();
-          if (item.scope === "group") groupControls?.refresh();
-          find('[data-panel="highlights"] .lr-panel-close').focus();
-          announce("Destaque removido.");
-        } catch {
-          remove.disabled = false;
-          announce("Não foi possível remover este destaque.");
-        }
-      });
-      entry.append(jump);
-      if (onUpdateHighlight) {
-        const edit = document.createElement("button");
-        edit.type = "button";
-        edit.className = "lr-edit-highlight";
-        edit.dataset.noteEdit = item.id;
-        edit.setAttribute("aria-label", `${item.note ? "Editar" : "Adicionar"} nota na página ${item.page + 1}`);
-        edit.title = item.note ? "Editar nota" : "Adicionar nota";
-        edit.innerHTML = icon("note");
-        edit.addEventListener("click", () => openEditor({ kind: "edit", item }), { signal });
-        entry.append(edit);
-      }
-      entry.append(remove);
+      const manage = document.createElement("button");
+      manage.type = "button";
+      manage.className = "lr-edit-highlight";
+      manage.dataset.highlightManage = item.id;
+      manage.setAttribute("aria-label", `Ver notas e opções do destaque na página ${item.page + 1}`);
+      manage.setAttribute("aria-haspopup", "dialog");
+      manage.title = "Ver notas e opções";
+      manage.innerHTML = icon("note");
+      manage.addEventListener("click", () => openManagedHighlight(item, manage));
+      entry.append(jump, manage);
       highlightedList.append(entry);
     }
   }
 
-  function openEditor(draft) {
+  function openColorEditor(selection = null) {
     if (editor.open) return;
-    editorDraft = draft;
-    const colorMode = draft.kind === "color";
-    const editing = draft.kind === "edit";
-    find("#lr-editor-title").textContent = colorMode ? "Adicionar cor" : editing ? "Editar nota" : "Adicionar nota";
-    find(".lr-color-field").hidden = !colorMode;
-    find(".lr-note-fields").hidden = colorMode;
-    find(".lr-note-color").hidden = editing;
+    editorDraft = { selection };
     editorError.hidden = true;
     editorSave.disabled = false;
-    editorSave.textContent = colorMode && draft.selection ? "Salvar e destacar" : "Salvar";
-    note.value = draft.item?.note ?? "";
-    noteScope.value = draft.item?.scope === "group" || draft.scope === "group" ? "group" : "private";
-    if (!colorMode && !editing) {
-      const options = paletteValues().map((color) => new Option(colorLabel(color), color));
-      noteColor.replaceChildren(...options);
-    }
-    if (colorMode) customColor.value = "#b9d6ee";
+    editorSave.textContent = selection ? "Salvar e destacar" : "Salvar";
+    customColor.value = "#b9d6ee";
 
     clearSelection();
     editor.showModal();
-    if (!colorMode) note.focus();
   }
 
-  async function saveSelection(snapshot, color, scope, memo = "") {
+  async function saveSelection(snapshot, color) {
     const { page: markedPage, fragments } = snapshot;
-    const results = await Promise.allSettled(fragments.map((fragment, index) =>
+    const results = await Promise.allSettled(fragments.map((fragment) =>
       Promise.resolve().then(() => onAddHighlight({
-        ...fragment, page: markedPage, color,
-        ...(scope === "group" ? { scope } : {}),
-        ...(memo && index === 0 ? { note: memo } : {}),
+        ...fragment, page: markedPage, color, scope: "private",
       })),
     ));
     if (signal.aborted) return;
@@ -770,7 +792,6 @@ export function renderReader(root, {
     highlights.push(...saved);
     if (page === markedPage) refreshHighlightPaint();
     displayHighlights();
-    if (scope === "group") groupControls?.refresh();
     announce(saved.length === fragments.length ? "Destaque salvo." : "Parte do destaque foi salva.");
   }
 
@@ -781,32 +802,17 @@ export function renderReader(root, {
     editorError.hidden = true;
     editorSave.disabled = true;
     try {
-      const memo = note.value.trim();
-      if (draft.kind === "color") {
-        const hex = customColor.value.toLowerCase();
-        if (!customColors.includes(hex)) {
-          const updated = await onAddColor(hex);
-          if (signal.aborted) return;
-          customColors = normalizePalette(updated ?? [...customColors, hex]);
-          displayPalette();
-        } else if (!draft.selection) {
-          throw new Error("Essa cor já está na paleta.");
-        }
-        if (draft.selection) await saveSelection(draft.selection, hex, draft.scope);
-        else announce("Cor adicionada à paleta.");
-      } else if (draft.kind === "edit") {
-        const patch = { note: memo, ...(groupActive ? { scope: noteScope.value } : {}) };
-        const saved = await onUpdateHighlight(draft.item.id, patch);
+      const hex = customColor.value.toLowerCase();
+      if (!customColors.includes(hex)) {
+        const updated = await onAddColor(hex);
         if (signal.aborted) return;
-        if (!saved?.id) throw new Error("Não foi possível salvar a nota.");
-        highlights = highlights.map((mark) => mark.id === saved.id ? saved : mark);
-        if (saved.page === page) refreshHighlightPaint();
-        displayHighlights();
-        if (saved.scope === "group" || draft.item.scope === "group") groupControls?.refresh();
-        announce("Nota salva.");
-      } else {
-        await saveSelection(draft.selection, noteColor.value, groupActive ? noteScope.value : "private", memo);
+        customColors = normalizePalette(updated ?? [...customColors, hex]);
+        displayPalette();
+      } else if (!draft.selection) {
+        throw new Error("Essa cor já está na paleta.");
       }
+      if (draft.selection) await saveSelection(draft.selection, hex);
+      else announce("Cor adicionada à paleta.");
       if (editorDraft === draft && editor.open) editor.close();
     } catch (error) {
       if (editorDraft === draft) {
@@ -855,9 +861,8 @@ export function renderReader(root, {
     if (!selectionData || selectionData.text !== selectedText || previous.block !== fragments[0].block ||
         previous.start !== fragments[0].start) {
       colors.hidden = true;
+      showOtherColors(false);
       colorToggle.setAttribute("aria-expanded", "false");
-      selectedScope = "private";
-      displayScope();
     }
     selectionData = { page, fragments, rect, text: selectedText };
     const dictionaryTerm = selectedText.match(/[\p{L}\p{M}]+(?:[-’'][\p{L}\p{M}]+)*/u)?.[0] ?? selectedText;
@@ -884,7 +889,7 @@ export function renderReader(root, {
       return;
     }
     if (event.target.closest("[data-add-color]") && onAddColor) {
-      openEditor({ kind: "color" });
+      openColorEditor();
       return;
     }
 
@@ -903,22 +908,18 @@ export function renderReader(root, {
     }
     if (event.target.closest("[data-highlight-toggle]") && selectionData) {
       colors.hidden = !colors.hidden;
+      if (colors.hidden) showOtherColors(false);
       colorToggle.setAttribute("aria-expanded", String(!colors.hidden));
       positionSelection(selectionData.rect);
     }
 
-    const scopeChoice = event.target.closest("[data-highlight-scope]");
-    if (scopeChoice && groupActive && selectionData) {
-      selectedScope = scopeChoice.dataset.highlightScope;
-      displayScope();
+    if (event.target.closest("[data-more-colors]") && selectionData) {
+      showOtherColors(otherColors.hidden);
+      positionSelection(selectionData.rect);
       return;
     }
     if (event.target.closest("[data-add-selection-color]") && onAddColor && selectionData) {
-      openEditor({ kind: "color", selection: selectionData, scope: groupActive ? selectedScope : "private" });
-      return;
-    }
-    if (event.target.closest("[data-note-create]") && selectionData) {
-      openEditor({ kind: "create", selection: selectionData, scope: selectedScope });
+      openColorEditor(selectionData);
       return;
     }
     const colorChoice = event.target.closest(".lr-colors [data-color]");
@@ -926,10 +927,9 @@ export function renderReader(root, {
 
     const snapshot = selectionData;
     const color = colorChoice.dataset.color;
-    const scope = groupActive ? selectedScope : "private";
     clearSelection();
     try {
-      await saveSelection(snapshot, color, scope);
+      await saveSelection(snapshot, color);
     } catch (error) {
       announce(error.message);
     }
@@ -965,6 +965,11 @@ export function renderReader(root, {
     onSwipe: step,
     onTap(x, target) {
       if (!(target instanceof Element) || target.closest("a, button, input") || !selectionMenu.hidden) return;
+      const highlight = target.closest("mark[data-highlight-id]");
+      if (highlight) {
+        openPaperHighlight(highlight);
+        return;
+      }
       const fraction = tapFraction(x);
       if (fraction >= 0.25 && fraction <= 0.75) showControls(!controlsOpen);
     },
@@ -1005,6 +1010,16 @@ export function renderReader(root, {
         event.defaultPrevented || event.button !== 0 || event.detail > 1 || gesture?.blocked ||
         !selectionMenu.hidden || !window.getSelection()?.isCollapsed ||
         event.target.closest("a, button, input")) return;
+
+    const highlight = event.target.closest("mark[data-highlight-id]");
+    if (highlight) {
+      const id = highlight.dataset.highlightId;
+      tapTimer = setTimeout(() => {
+        const trigger = article.contains(highlight) ? highlight : visibleMark(id);
+        if (trigger && !hasReadingSelection()) openPaperHighlight(trigger);
+      }, 240);
+      return;
+    }
 
     const fraction = tapFraction(event.clientX);
     if (!Number.isFinite(fraction) || fraction < 0 || fraction > 1) return;
@@ -1068,12 +1083,12 @@ export function renderReader(root, {
   }, { signal });
 
   document.addEventListener("pointerdown", (event) => {
-    if (!editor.open && activePanel && event.target instanceof Element &&
+    if (!editor.open && !highlightPanel?.isOpen && activePanel && event.target instanceof Element &&
         !event.target.closest("[data-panel], [data-toggle]")) showPanel(null);
   }, { signal });
 
   document.addEventListener("keydown", (event) => {
-    if (editor.open) return;
+    if (editor.open || highlightPanel?.isOpen) return;
     if (event.key === "Escape") {
       if (!selectionMenu.hidden) {
         clearSelection();
@@ -1084,6 +1099,12 @@ export function renderReader(root, {
     if (activePanel || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey ||
         (event.target instanceof Element && event.target.closest("input, textarea, select, [contenteditable]")) ||
         touchRange || !window.getSelection()?.isCollapsed) return;
+    const highlight = event.target instanceof Element && event.target.closest("mark[data-highlight-id]");
+    if (highlight && article.contains(highlight) && (event.key === "Enter" || event.key === " ")) {
+      event.preventDefault();
+      openPaperHighlight(highlight);
+      return;
+    }
     if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
       event.preventDefault();
       step(event.key === "ArrowRight" ? 1 : -1);
@@ -1093,6 +1114,19 @@ export function renderReader(root, {
   window.addEventListener("resize", reflow, { signal });
   const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(reflow);
   observer?.observe(article);
+
+  highlightPanel = installHighlightPanel(element, {
+    signal,
+    loadNotes,
+    addNote,
+    updateNote,
+    deleteNote,
+    onRemoveHighlight: onRemoveHighlight ? removeManagedHighlight : undefined,
+    onUpdateHighlight: onUpdateHighlight ? updateManagedHighlight : undefined,
+    viewerId,
+    getGroup: () => groupState,
+    announce,
+  });
 
   groupControls = installReaderGroup({
     button: find('[data-toggle="group"]'),
@@ -1115,12 +1149,14 @@ export function renderReader(root, {
       void goTo(mark.page, { block: mark.block, offset: mark.start });
       showPanel(null, true);
     },
+    onOpenHighlight(mark, trigger) {
+      openManagedHighlight(mark, trigger ?? document.activeElement);
+    },
     announce,
   });
 
   displayPreferences();
   displayPalette();
-  displayScope();
   displayHighlights();
   displayLoading();
   displayPage();
@@ -1128,6 +1164,7 @@ export function renderReader(root, {
 
   const cleanup = () => {
     if (editor.open) editor.close();
+    highlightPanel.cleanup();
     controller.abort();
     layoutController.abort();
     cancelPageLoad();
@@ -1173,6 +1210,7 @@ export function renderReader(root, {
         if (highlights.slice(length).some((mark) => mark.page === page)) refreshHighlightPaint();
       }
     }
+    maybeOpenInitialHighlight();
     if (displayed !== pages[page]) {
       void goTo(page, anchor, { persist: false });
     } else if (!displayed) {

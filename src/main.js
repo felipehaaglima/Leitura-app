@@ -4,6 +4,7 @@ import {
   addPendingHighlight, clearPendingReading, pendingReading, removePendingHighlight,
   savePendingPosition, syncPendingReading, updatePendingHighlight,
 } from './pending-reading.js'
+import { deleteLocalNote, localHighlightNotes, writeLocalNote } from './reading-notes.js'
 import { sampleBooks } from './samples.js'
 
 const app = document.querySelector('#app')
@@ -263,7 +264,7 @@ async function renderHighlights() {
     const markedBooks = [...imported.values(), ...examples].filter(book => book.highlights.length)
     results.innerHTML = markedBooks.length
       ? markedBooks.map(book => `<section class="highlight-group"><h2>${escape(book.title)}</h2>${
-        book.highlights.map(mark => `<button type="button" class="highlight-entry" data-book="${escape(book.id)}" data-page="${mark.page}" data-block="${mark.block}" data-offset="${mark.start}">
+        book.highlights.map(mark => `<button type="button" class="highlight-entry" data-book="${escape(book.id)}" data-highlight-id="${escape(mark.id)}" data-page="${mark.page}" data-block="${mark.block}" data-offset="${mark.start}">
           <span class="swatch swatch-${escape(mark.color || 'yellow')}"${/^#[0-9a-f]{6}$/i.test(mark.color) ? ` style="background-color:${mark.color}"` : ''}></span>
           <span><q>${escape(mark.text)}</q>${mark.note ? `<span class="highlight-note">${escape(mark.note)}</span>` : ''}<small>Página ${mark.page + 1}${mark.scope === 'group' ? ' · Grupo' : ''}</small></span>${icon('chevron')}
         </button>`).join('')
@@ -340,7 +341,7 @@ async function mountSocial() {
       socialCleanup = renderSocial(target, {
         user, api,
         onSignIn: () => showAuth(),
-        onBook: id => void openBook(id),
+        onBook: (...args) => void openBook(...args),
         onLibraryChanged: refreshBooks,
       })
     }
@@ -721,7 +722,7 @@ function showOpenFailure(error, retry, reload) {
   dialog.querySelector('#retry-open-book').onclick = reload ? () => window.location.reload() : retry
 }
 
-async function openBook(id, explicitPage, explicitAnchor) {
+async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
   const request = ++readerRequest
   const account = user?.id
   const sample = sampleBooks.find(book => book.id === id)
@@ -763,6 +764,29 @@ async function openBook(id, explicitPage, explicitAnchor) {
       ? [...marks, ...pending.highlights.filter(mark => !marks.some(item => item.id === mark.id))]
       : marks
     const session = { preview: Boolean(book.loading) }
+    const notesPath = markId => `/books/${id}/highlights/${markId}/notes`
+    const localMark = markId => sample
+      ? sampleProgress.highlights.find(mark => mark.id === markId)
+      : pendingReading(account, id).highlights.find(mark => mark.id === markId)
+    const saveLocalMark = (markId, changes) => {
+      if (!sample) return updatePendingHighlight(account, id, markId, changes)
+      const index = sampleProgress.highlights.findIndex(mark => mark.id === markId)
+      if (index < 0) throw new Error('Destaque não encontrado.')
+      const highlight = { ...sampleProgress.highlights[index], ...changes }
+      sampleProgress.highlights[index] = highlight
+      storeSample(sample, sampleProgress, account)
+      return highlight
+    }
+    const saveNote = async (markId, noteId, data) => {
+      if (sample || session.preview) {
+        const result = writeLocalNote(localMark(markId), noteId, data)
+        saveLocalMark(markId, result.changes)
+        return result.note
+      }
+      await syncPendingReading(api, account, id).catch(() => {})
+      const path = notesPath(markId)
+      return (await api(noteId ? `${path}/${noteId}` : path, { method: noteId ? 'PATCH' : 'POST', data })).note
+    }
     const savePosition = async (page, nextAnchor = { block: 0, offset: 0 }) => {
       if (sample) {
         sampleProgress.position = page
@@ -790,6 +814,7 @@ async function openBook(id, explicitPage, explicitAnchor) {
     readerCleanup = reader.renderReader(app, {
       book: readerBook,
       loadPage: book.loadPage,
+      initialHighlightId,
       onExit: exitReader,
       palette: highlightPalette,
       viewerId: account,
@@ -819,18 +844,25 @@ async function openBook(id, explicitPage, explicitAnchor) {
         return highlight
       },
       onUpdateHighlight: async (highlightId, changes) => {
-        if (sample) {
-          const index = sampleProgress.highlights.findIndex(mark => mark.id === highlightId)
-          if (index === -1) throw new Error('Destaque não encontrado.')
-          const highlight = { ...sampleProgress.highlights[index], ...changes }
-          sampleProgress.highlights[index] = highlight
-          storeSample(sample, sampleProgress, account)
-          return highlight
-        }
-        if (session.preview) return updatePendingHighlight(account, id, highlightId, changes)
+        if (sample || session.preview) return saveLocalMark(highlightId, changes)
         await syncPendingReading(api, account, id).catch(() => {})
         const { highlight } = await api(`/books/${id}/highlights/${highlightId}`, { method: 'PATCH', data: changes })
         return highlight
+      },
+      loadNotes: async (markId, { signal: noteSignal } = {}) => {
+        if (sample || session.preview) return localHighlightNotes(localMark(markId))
+        if (localMark(markId)) await syncPendingReading(api, account, id).catch(() => {})
+        return (await readRequest(notesPath(markId), noteSignal)).notes
+      },
+      addNote: (markId, data) => saveNote(markId, null, data),
+      updateNote: (markId, noteId, data) => saveNote(markId, noteId, data),
+      deleteNote: async (markId, noteId) => {
+        if (sample || session.preview) {
+          saveLocalMark(markId, deleteLocalNote(localMark(markId), noteId))
+          return
+        }
+        await syncPendingReading(api, account, id).catch(() => {})
+        await api(`${notesPath(markId)}/${noteId}`, { method: 'DELETE' })
       },
       onRemoveHighlight: async highlightId => {
         if (sample) {
@@ -867,7 +899,7 @@ async function openBook(id, explicitPage, explicitAnchor) {
     window.scrollTo(0, 0)
   } catch (error) {
     if (active()) {
-      showOpenFailure(error, () => void openBook(id, explicitPage, explicitAnchor), moduleFailed)
+      showOpenFailure(error, () => void openBook(id, explicitPage, explicitAnchor, initialHighlightId), moduleFailed)
     }
   } finally {
     if (openingBook === controller) {
@@ -880,14 +912,14 @@ async function openBook(id, explicitPage, explicitAnchor) {
 app.addEventListener('click', event => {
   const button = event.target.closest('button')
   if (!button) return
-  const { action, section: targetSection, book, deleteBook, page, block, offset, filter: targetFilter } = button.dataset
+  const { action, section: targetSection, book, deleteBook, page, block, offset, highlightId, filter: targetFilter } = button.dataset
   if (action === 'upload') showUpload()
   if (action === 'read-import-preview') readAvailablePages()
   if (action === 'account') showAccount()
   if (deleteBook) showDeleteBook(deleteBook)
   if (book) {
     const anchor = block === undefined ? undefined : { block: Number(block), offset: Number(offset) }
-    void openBook(book, page === undefined ? undefined : Number(page), anchor)
+    void openBook(book, page === undefined ? undefined : Number(page), anchor, highlightId)
   }
   if (targetSection) {
     readerRequest++

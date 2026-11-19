@@ -43,10 +43,10 @@ O servidor cria as tabelas na primeira operação que precisa do banco. Na Verce
 - A porcentagem da importação fica visível na biblioteca depois de fechar a janela de importação. Com a aba aberta, o processamento segue em segundo plano. Ao voltar no mesmo navegador após fechar a aba ou recarregar a página, a importação retoma a partir do progresso salvo. O arquivo usado na retomada fica temporariamente no navegador e é removido ao concluir ou descartar a importação.
 - Use **Ler páginas disponíveis** assim que a primeira página estiver pronta. As próximas aparecem no leitor conforme forem processadas. O progresso e os destaques dessa leitura são salvos no livro ao concluir a importação.
 - Use a lixeira no cartão de um PDF para apagá-lo da biblioteca. A confirmação também remove o progresso e os destaques daquele livro.
-- O destaque oferece três cores iniciais. Em **Aparência** ou no menu de destaque, adicione outras cores à sua conta. Para anotar um trecho, escolha **Adicionar nota** ao selecionar o texto ou edite uma nota nos destaques do leitor.
+- Selecione o texto e use **Destacar** para marcar com uma das três cores iniciais. Use **Outras cores** para escolher ou cadastrar mais cores. Toque no trecho já destacado para remover a marcação ou adicionar, editar e remover suas notas.
 
 ## Social
 
 - Copie seu ID na aba **Social** e use o ID de outra pessoa para enviar um pedido de amizade. Após o aceite, vocês podem visitar os perfis e ver os livros e o progresso um do outro.
 - No perfil de um amigo, solicite uma cópia de um livro. Quando o dono aprova, a cópia entra na sua biblioteca com o nome de quem compartilhou. Ela tem progresso e destaques próprios.
-- No leitor de um livro compartilhado, toque no centro e abra **Leitura em grupo** para convidar quem tem uma cópia. Quem aceitar passa a ver a posição dos participantes e os destaques que eles escolherem compartilhar. Cada destaque com nota pode ficar pessoal ou visível para o grupo.
+- No leitor de um livro compartilhado, toque no centro e abra **Leitura em grupo** para convidar quem tem uma cópia. Quem aceitar passa a ver a posição dos participantes e os destaques que eles escolherem compartilhar. No painel do destaque, escolha se ele aparece no grupo. Cada nota tem sua própria visibilidade. Em uma nota de grupo, selecione participantes para mencioná-los. A menção leva ao trecho pela aba **Social**.

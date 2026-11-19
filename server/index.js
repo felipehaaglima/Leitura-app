@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createStorage } from './database.js';
 import { createSocialAPI } from './social.js';
+import { createNotesAPI } from './notes.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const dataDirectory = resolve(process.env.LEITURA_DATA_DIR || resolve(root, 'data'));
@@ -70,7 +71,9 @@ const updateProgressSql = `
 const highlightFields = `
   highlights.id, highlights.page, highlights.block, highlights."start", highlights."end",
   highlights.text, highlights.color, highlights.created_at AS "createdAt",
-  COALESCE(highlight_details.note, '') AS note, COALESCE(highlight_details.scope, 'private') AS scope
+  COALESCE(NULLIF(highlight_details.note, ''),
+    (SELECT text FROM highlight_notes WHERE id = highlights.id AND highlight_id = highlights.id), '') AS note,
+  COALESCE(highlight_details.scope, 'private') AS scope
 `;
 const highlightDetailsJoin = 'LEFT JOIN highlight_details ON highlight_details.highlight_id = highlights.id';
 const highlightByIdSql = `
@@ -139,6 +142,7 @@ class HttpError extends Error {
 }
 
 const social = createSocialAPI({ storage, readJson, respondJson, HttpError });
+const notes = createNotesAPI({ storage, readJson, respondJson, HttpError, social });
 
 function respondJson(response, status, body) {
   const payload = JSON.stringify(body);
@@ -529,7 +533,15 @@ async function editHighlight(request, response, bookId, highlightId, userId) {
     const note = requestedNote ?? existing.note;
     const scope = requestedScope ?? existing.scope;
     if (scope === 'group' && existing.scope !== 'group') await verifyHighlightSharing(connection, bookId, userId);
-    await writeHighlightDetails(connection, highlightId, note, scope);
+    if (existing.scope !== scope) await notes.preserveLegacyNote(connection, highlightId);
+    if (requestedNote === undefined) {
+      if (existing.scope !== scope) {
+        await writeHighlightDetails(connection, highlightId, '', scope);
+      }
+    } else {
+      const materialized = await notes.writeLegacyNote(connection, highlightId, note);
+      await writeHighlightDetails(connection, highlightId, materialized ? '' : note, scope);
+    }
     return { ...existing, note, scope };
   });
   respondJson(response, 200, { highlight });
@@ -718,6 +730,7 @@ async function handleApi(request, response, pathname, searchParams, hosted) {
   if (!user) throw new HttpError(401, 'Entre na sua conta para continuar.');
 
   if (pathname.startsWith('/api/social') && await social.handle(request, response, pathname, searchParams, user)) return;
+  if (await notes.handle(request, response, pathname, searchParams, user)) return;
 
   if (pathname === '/api/highlights' && method === 'GET') {
     const { rows, nextOffset } = await listRows(listAccountHighlightsSql, user.id, searchParams, highlightBatchSize, hosted);

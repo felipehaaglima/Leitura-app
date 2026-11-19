@@ -1,0 +1,234 @@
+.lr-hp {
+  width: min(36rem, calc(100vw - 24px));
+  max-height: calc(100% - 24px);
+  max-height: min(44rem, calc(100dvh - 24px));
+  padding: clamp(14px, 3vw, 22px);
+  border: 1px solid var(--lr-border, #e6e6e6);
+  border-radius: 13px;
+  color: var(--lr-ink, #444);
+  background: var(--lr-paper, #fff);
+  font-family: var(--lr-ui-font, system-ui, sans-serif);
+  overflow: auto;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+}
+
+.lr-hp::backdrop {
+  background: #22302565;
+}
+
+.lr-hp-heading,
+.lr-hp-meta,
+.lr-hp-notes-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.lr-hp h2,
+.lr-hp h3,
+.lr-hp p {
+  margin: 0;
+}
+
+.lr-hp h2 {
+  font-size: 1.2rem;
+}
+
+.lr-hp h3 {
+  font-size: 1rem;
+}
+
+.lr-hp-excerpt {
+  max-height: 9em;
+  overflow: auto;
+  overscroll-behavior: contain;
+  margin: 12px 0 9px;
+  padding: 8px 12px;
+  border-inline-start: 4px solid var(--lr-highlight, var(--lr-amber, #f3d67e));
+  border-radius: 4px;
+  background: var(--lr-hover, #f3f3f3);
+  font: 400 1.12rem/1.45 var(--lr-reading-font, Georgia, serif);
+  white-space: pre-wrap;
+}
+
+.lr-hp-attribution,
+.lr-hp-note-meta,
+.lr-hp-note-actions,
+.lr-hp-private,
+.lr-hp-count,
+.lr-hp-notes-status {
+  color: var(--lr-muted, #646464);
+  font-size: .875rem;
+}
+
+.lr-hp-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.lr-reader .lr-hp button.lr-hp-button {
+  min-height: 44px;
+  padding: 7px 11px;
+  border: 1px solid var(--lr-border, #e6e6e6);
+  border-radius: 8px;
+  color: var(--lr-ink, #444);
+  background: var(--lr-paper, #fff);
+  font-size: .875rem;
+  font-weight: 650;
+  text-align: center;
+}
+
+.lr-reader .lr-hp button.lr-hp-button:not(:disabled):hover {
+  background: var(--lr-hover, #f3f3f3);
+}
+
+.lr-reader .lr-hp button.lr-hp-primary {
+  border-color: var(--lr-accent, #4d6146);
+  color: #fff;
+  background: var(--lr-accent, #4d6146);
+}
+
+.lr-reader .lr-hp button.lr-hp-primary:not(:disabled):hover {
+  background: #43563f;
+}
+
+.lr-reader .lr-hp button.lr-hp-danger,
+.lr-hp-error {
+  color: #8f392d;
+}
+
+.lr-hp .lr-hp-error,
+.lr-hp .lr-hp-feedback,
+.lr-hp-confirm {
+  margin-top: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--lr-border, #e6e6e6);
+  border-radius: 8px;
+  background: #f7f7f7;
+  font-size: .875rem;
+}
+
+.lr-hp .lr-hp-error,
+.lr-hp-confirm {
+  border-color: #ecd9d4;
+  background: #fffbfa;
+}
+
+.lr-hp-confirm .lr-hp-actions {
+  margin-top: 8px;
+}
+
+.lr-hp-notes,
+.lr-hp-composer {
+  margin-top: 13px;
+  padding-top: 10px;
+  border-top: 1px solid var(--lr-border, #e6e6e6);
+}
+
+.lr-hp .lr-hp-notes-status,
+.lr-hp [data-hp="retry"] {
+  margin-top: 7px;
+}
+
+.lr-hp-note-list,
+.lr-hp-mention-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.lr-hp-note {
+  display: grid;
+  gap: 6px;
+  padding-block: 10px;
+  border-bottom: 1px solid var(--lr-border, #e6e6e6);
+}
+
+.lr-hp-note:last-child {
+  border-bottom: 0;
+  padding-bottom: 1px;
+}
+
+.lr-hp-note-meta {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+
+.lr-hp-note-text {
+  color: var(--lr-ink, #444);
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.lr-hp-composer {
+  display: grid;
+  gap: 8px;
+}
+
+.lr-hp-composer label {
+  display: grid;
+  gap: 5px;
+  font-size: .875rem;
+  font-weight: 650;
+}
+
+.lr-hp textarea,
+.lr-hp select {
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 9px;
+  border: 1px solid #d4d4d4;
+  border-radius: 8px;
+  color: var(--lr-ink, #444);
+  background: var(--lr-paper, #fff);
+  font: inherit;
+}
+
+.lr-hp textarea {
+  resize: vertical;
+  line-height: 1.45;
+}
+
+.lr-hp textarea:focus-visible {
+  outline: 2px solid var(--lr-accent, #4d6146);
+  outline-offset: 3px;
+}
+
+.lr-hp-count {
+  text-align: end;
+}
+
+.lr-hp-mentions {
+  display: grid;
+  gap: 6px;
+}
+
+.lr-hp-mention-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.lr-hp li.lr-hp-chip,
+.lr-reader .lr-hp button.lr-hp-chip {
+  padding: 4px 9px;
+  border: 1px solid #dce4d9;
+  border-radius: 999px;
+  color: #425140;
+  background: #f0f4ee;
+  font-size: .8125rem;
+}
+
+@media (max-width: 440px) {
+  .lr-hp-meta {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
