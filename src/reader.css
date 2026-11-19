@@ -1,10 +1,13 @@
 .lr-reader {
   --lr-ink: #444;
+  --lr-reading-ink: var(--lr-theme-ink, #555);
   --lr-muted: #646464;
-  --lr-paper: #fff;
+  --lr-paper: var(--lr-theme-paper, #fff);
   --lr-hover: #f3f3f3;
   --lr-border: #e6e6e6;
   --lr-accent: #4d6146;
+  --lr-accent-ink: #fff;
+  --lr-danger: #8f392d;
   --lr-amber: #f3d67e;
   --lr-green: #bbd6ad;
   --lr-pink: #efc0c3;
@@ -29,6 +32,37 @@
   background: var(--lr-paper);
   font-family: var(--lr-ui-font);
   font-size: 1rem;
+}
+
+.lr-reader[data-theme]:not([data-theme="classic"]) {
+  --lr-ink: var(--lr-reading-ink);
+  --lr-muted: color-mix(in srgb, var(--lr-ink) 84%, var(--lr-paper));
+  --lr-hover: color-mix(in srgb, var(--lr-ink) 8%, var(--lr-paper));
+  --lr-border: color-mix(in srgb, var(--lr-ink) 22%, var(--lr-paper));
+  --lr-peer-surface: var(--lr-hover);
+  --lr-chip-outline: var(--lr-border);
+  --lr-chip-ink: var(--lr-accent);
+  --lr-chip-surface: var(--lr-hover);
+  --lr-accent-hover: color-mix(in srgb, var(--lr-accent) 86%, var(--lr-ink));
+}
+
+.lr-reader[data-theme="sepia"] { --lr-accent: #6d4f2d; }
+.lr-reader[data-theme="sand"] { --lr-accent: #635644; }
+.lr-reader[data-theme="sage"] { --lr-accent: #3d5c47; }
+.lr-reader[data-theme="dusk"] { --lr-accent: #bdcfef; }
+.lr-reader[data-theme="night"] { --lr-accent: #adcaaf; }
+
+.lr-reader:is([data-theme="dusk"], [data-theme="night"]) {
+  color-scheme: dark;
+  --lr-accent-ink: #15201d;
+  --lr-accent-hover: color-mix(in srgb, var(--lr-accent) 86%, var(--lr-paper));
+  --lr-danger: #ffb6a5;
+  --lr-danger-border: #745250;
+  --lr-danger-surface: #382c30;
+  --lr-feedback-surface: var(--lr-hover);
+  --lr-input-border: var(--lr-border);
+  --lr-toolbar: #151a1f;
+  --lr-toolbar-ink: #f0ede8;
 }
 
 .lr-reader,
@@ -167,7 +201,7 @@
 
 .lr-paper p {
   margin: 0;
-  color: #555;
+  color: var(--lr-reading-ink);
   font-family: var(--lr-reading-font);
   font-size: var(--lr-text-size);
   font-weight: 400;
@@ -208,6 +242,10 @@
   border-radius: 2px;
   -webkit-box-decoration-break: clone;
   box-decoration-break: clone;
+}
+
+.lr-reader:is([data-theme="dusk"], [data-theme="night"]) .lr-paper mark[data-color^="#"] {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--lr-highlight) 35%, var(--lr-reading-ink));
 }
 
 .lr-paper mark[data-highlight-id] {
@@ -567,6 +605,91 @@
   font-size: .9375rem;
 }
 
+.lr-appearance-themes {
+  min-inline-size: 0;
+  margin: 14px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.lr-appearance-themes legend {
+  margin-block-end: 8px;
+  padding: 0;
+  font-size: .9375rem;
+  font-weight: 700;
+}
+
+.lr-theme-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.lr-theme-option {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  min-block-size: 44px;
+  min-inline-size: 0;
+  padding: 5px;
+  border: 1px solid var(--lr-border);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: .75rem;
+  font-weight: 500;
+  line-height: 1.25;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.lr-theme-option input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+.lr-theme-option:hover {
+  background: var(--lr-hover);
+}
+
+.lr-theme-option:has(:checked) {
+  border-color: var(--lr-accent);
+  box-shadow: inset 0 0 0 1px var(--lr-accent);
+  font-weight: 700;
+}
+
+.lr-theme-option:has(:focus-visible) {
+  outline: 2px solid var(--lr-accent);
+  outline-offset: 2px;
+}
+
+.lr-theme-swatch {
+  display: grid;
+  inline-size: 100%;
+  min-block-size: 33px;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--lr-swatch-ink) 22%, var(--lr-swatch-paper));
+  border-radius: 4px;
+  color: var(--lr-swatch-ink);
+  background: var(--lr-swatch-paper);
+  font: 1.125rem/1 var(--lr-reading-font);
+}
+
+.lr-theme-message {
+  margin: 7px 0 0;
+  color: var(--lr-danger);
+  font-size: .8125rem;
+  line-height: 1.4;
+}
+
+.lr-theme-message:empty {
+  margin: 0;
+}
+
 .lr-reader [data-add-color] {
   min-height: 44px;
   flex: none;
@@ -722,7 +845,7 @@
 
 .lr-editor-error {
   margin: 12px 0 0;
-  color: #8f392d;
+  color: var(--lr-danger);
   font-size: .875rem;
 }
 
@@ -743,7 +866,7 @@
 }
 
 .lr-reader .lr-editor-save {
-  color: #fff;
+  color: var(--lr-accent-ink);
   background: var(--lr-accent);
 }
 

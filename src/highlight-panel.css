@@ -89,17 +89,17 @@
 
 .lr-reader .lr-hp button.lr-hp-primary {
   border-color: var(--lr-accent, #4d6146);
-  color: #fff;
+  color: var(--lr-accent-ink, #fff);
   background: var(--lr-accent, #4d6146);
 }
 
 .lr-reader .lr-hp button.lr-hp-primary:not(:disabled):hover {
-  background: #43563f;
+  background: var(--lr-accent-hover, #43563f);
 }
 
 .lr-reader .lr-hp button.lr-hp-danger,
 .lr-hp-error {
-  color: #8f392d;
+  color: var(--lr-danger, #8f392d);
 }
 
 .lr-hp .lr-hp-error,
@@ -109,14 +109,14 @@
   padding: 9px 11px;
   border: 1px solid var(--lr-border, #e6e6e6);
   border-radius: 8px;
-  background: #f7f7f7;
+  background: var(--lr-feedback-surface, #f7f7f7);
   font-size: .875rem;
 }
 
 .lr-hp .lr-hp-error,
 .lr-hp-confirm {
-  border-color: #ecd9d4;
-  background: #fffbfa;
+  border-color: var(--lr-danger-border, #ecd9d4);
+  background: var(--lr-danger-surface, #fffbfa);
 }
 
 .lr-hp-confirm .lr-hp-actions {
@@ -184,7 +184,7 @@
   width: 100%;
   min-height: 44px;
   padding: 8px 9px;
-  border: 1px solid #d4d4d4;
+  border: 1px solid var(--lr-input-border, #d4d4d4);
   border-radius: 8px;
   color: var(--lr-ink, #444);
   background: var(--lr-paper, #fff);
@@ -219,10 +219,10 @@
 .lr-hp li.lr-hp-chip,
 .lr-reader .lr-hp button.lr-hp-chip {
   padding: 4px 9px;
-  border: 1px solid #dce4d9;
+  border: 1px solid var(--lr-chip-outline, #dce4d9);
   border-radius: 999px;
-  color: #425140;
-  background: #f0f4ee;
+  color: var(--lr-chip-ink, #425140);
+  background: var(--lr-chip-surface, #f0f4ee);
   font-size: .8125rem;
 }
 

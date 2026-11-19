@@ -5,6 +5,7 @@ import { installReaderTouch } from "./reader-touch.js";
 import { applyReaderColor, colorLabel, normalizePalette, tones } from "./reader-colors.js";
 import { installReaderGroup } from "./reader-group.js";
 import { installHighlightPanel } from "./highlight-panel.js";
+import { READER_THEMES, normalizeReaderTheme } from "./reader-themes.js";
 
 const icons = {
   library: '<path d="M3 4h3v16H3zM9 4h3v16H9zM15 5l3-1 4 15-3 1z" />',
@@ -129,7 +130,7 @@ function partSuffix(index) {
 export function renderReader(root, {
   book, onExit, onPosition, onAddHighlight, onRemoveHighlight, loadPage,
   palette, onAddColor, onUpdateHighlight, viewerId, onLoadGroup, onStartGroup, onRespondGroup,
-  loadNotes, addNote, updateNote, deleteNote, initialHighlightId,
+  loadNotes, addNote, updateNote, deleteNote, initialHighlightId, theme, onChangeTheme,
 }) {
   let pages = book.pages ?? [];
   let knownCount = book.pageCount;
@@ -159,6 +160,9 @@ export function renderReader(root, {
   let highlightRepaintPending = false;
   let positionUpdates = Promise.resolve();
   let preferences = readPreferences();
+  let savedTheme = normalizeReaderTheme(theme);
+  let pendingThemeSaves = 0;
+  let themeSelection = 0;
   let controlsOpen = false;
   let selectionData;
   let touchRange;
@@ -224,6 +228,19 @@ export function renderReader(root, {
           <button type="button" aria-label="Aumentar texto" data-size="1">A+</button>
         </div>
       </div>
+      <fieldset class="lr-appearance-themes">
+        <legend>Tema de leitura</legend>
+        <div class="lr-theme-options">
+          ${READER_THEMES.map(({ id, label, background, foreground }) => `
+            <label class="lr-theme-option">
+              <input type="radio" name="lr-theme" value="${id}">
+              <span class="lr-theme-swatch" aria-hidden="true" style="--lr-swatch-paper:${background};--lr-swatch-ink:${foreground}">Aa</span>
+              <span>${label}</span>
+            </label>
+          `).join("")}
+        </div>
+        <p class="lr-theme-message" role="status"></p>
+      </fieldset>
       <label class="lr-panel-row" for="lr-language">Traduzir para
         <select id="lr-language">
           <option value="pt">Português</option><option value="en">Inglês</option>
@@ -297,6 +314,8 @@ export function renderReader(root, {
   const editorError = find(".lr-editor-error");
   const editorSave = find(".lr-editor-save");
   const customColor = find('[name="color"]');
+  const themeOptions = find(".lr-theme-options");
+  const themeMessage = find(".lr-theme-message");
 
   displayTitle(book.title);
   if (book.source?.startsWith("https://pt.wikisource.org/wiki/")) {
@@ -333,6 +352,34 @@ export function renderReader(root, {
       }
     }
   }
+
+  function displayTheme(id) {
+    const { background, foreground } = READER_THEMES.find((option) => option.id === id);
+    element.dataset.theme = id;
+    element.style.setProperty("--lr-theme-paper", background);
+    element.style.setProperty("--lr-theme-ink", foreground);
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", background);
+    themeOptions.querySelector(`[value="${id}"]`).checked = true;
+  }
+
+  themeOptions.addEventListener("change", async (event) => {
+    const selected = normalizeReaderTheme(event.target.value);
+    const selection = ++themeSelection;
+    pendingThemeSaves++;
+    themeMessage.textContent = "";
+    displayTheme(selected);
+    try {
+      savedTheme = normalizeReaderTheme(onChangeTheme ? await onChangeTheme(selected) : selected);
+    } catch {
+      if (signal.aborted || selection !== themeSelection) return;
+      const message = "Não foi possível salvar o tema. Tente novamente.";
+      themeMessage.textContent = message;
+      if (activePanel !== "appearance") announce(message);
+    } finally {
+      pendingThemeSaves--;
+      if (!signal.aborted && pendingThemeSaves === 0) displayTheme(savedTheme);
+    }
+  }, { signal });
 
   function displayCounter() {
     const total = pageTotal();
@@ -1156,6 +1203,7 @@ export function renderReader(root, {
   });
 
   displayPreferences();
+  displayTheme(savedTheme);
   displayPalette();
   displayHighlights();
   displayLoading();
@@ -1175,7 +1223,7 @@ export function renderReader(root, {
   };
   cleanup.updateBook = ({
     pages: nextPages, pageCount, loading: nextLoading, title, highlights: nextHighlights,
-    loadPage: nextLoader, additionalHighlights, palette: nextPalette, onLoadGroup: nextGroupLoader,
+    loadPage: nextLoader, additionalHighlights, palette: nextPalette, onLoadGroup: nextGroupLoader, theme: nextTheme,
   }) => {
     if (signal.aborted) return;
     if (nextPages) pages = nextPages;
@@ -1185,6 +1233,10 @@ export function renderReader(root, {
     if (nextGroupLoader !== undefined) groupControls.setLoader(nextGroupLoader);
     else if (nextLoading === null) groupControls.refresh();
     if (title !== undefined) displayTitle(title);
+    if (nextTheme !== undefined) {
+      savedTheme = normalizeReaderTheme(nextTheme);
+      if (pendingThemeSaves === 0) displayTheme(savedTheme);
+    }
     if (nextPalette) {
       customColors = normalizePalette(nextPalette);
       displayPalette();

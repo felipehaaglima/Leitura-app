@@ -79,6 +79,11 @@ const schema = `
     PRIMARY KEY (user_id, color)
   ) TABLE_OPTION;
 
+  CREATE TABLE IF NOT EXISTS reader_preferences (
+    user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    theme TEXT NOT NULL
+  ) TABLE_OPTION;
+
   CREATE TABLE IF NOT EXISTS social_friendships (
     id TEXT PRIMARY KEY,
     left_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

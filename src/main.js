@@ -4,9 +4,11 @@ import {
   addPendingHighlight, clearPendingReading, pendingReading, removePendingHighlight,
   savePendingPosition, syncPendingReading, updatePendingHighlight,
 } from './pending-reading.js'
+import { normalizeReaderTheme } from './reader-themes.js'
 import { deleteLocalNote, localHighlightNotes, writeLocalNote } from './reading-notes.js'
 import { sampleBooks } from './samples.js'
 
+const guestThemeKey = 'margem:reader-theme:guest'
 const app = document.querySelector('#app')
 const dialog = document.querySelector('#dialog')
 const toast = document.querySelector('#toast')
@@ -36,6 +38,7 @@ let user = null
 let books = []
 let booksVersion = 0
 let highlightPalette = []
+let themePreference = { account: null, theme: guestReaderTheme(), revision: 0, writeQueue: Promise.resolve() }
 let section = 'library'
 let filter = 'all'
 let query = ''
@@ -384,6 +387,7 @@ function showAuth(mode = 'login', after) {
       const data = Object.fromEntries(new FormData(form))
       user = (await api(register ? '/register' : '/login', { method: 'POST', data })).user
       void refreshPalette(user.id)
+      setThemeAccount(user.id)
       try { await refreshBooks() } catch (failure) { announce(failure.message) }
       await setupImports()
       dialog.close()
@@ -636,6 +640,58 @@ async function refreshPalette(account) {
   }
 }
 
+function guestReaderTheme() {
+  try {
+    return normalizeReaderTheme(localStorage.getItem(guestThemeKey))
+  } catch {
+    return 'classic'
+  }
+}
+
+function setThemeAccount(account) {
+  const preference = { account, theme: account ? 'classic' : guestReaderTheme(), revision: 0, writeQueue: Promise.resolve() }
+  themePreference = preference
+  readerCleanup?.updateBook({ theme: preference.theme })
+  if (account) void refreshReaderTheme(preference)
+}
+
+async function refreshReaderTheme(preference) {
+  const revision = preference.revision
+  try {
+    const { theme } = await readRequest('/reader/theme')
+    if (themePreference !== preference || revision !== preference.revision) return
+    preference.theme = normalizeReaderTheme(theme)
+    readerCleanup?.updateBook({ theme: preference.theme })
+  } catch {
+    // The reader stays usable with its current theme if the preference cannot be loaded.
+  }
+}
+
+function saveReaderTheme(preference, theme, session) {
+  const pending = preference.writeQueue.then(async () => {
+    if (themePreference !== preference) throw new Error('Abra o leitor novamente para alterar o tema.')
+    let savedTheme = normalizeReaderTheme(theme)
+    if (preference.account) {
+      const saved = await api('/reader/theme', { method: 'PUT', data: { theme: savedTheme } })
+      savedTheme = normalizeReaderTheme(saved.theme)
+    } else {
+      try {
+        localStorage.setItem(guestThemeKey, savedTheme)
+      } catch {
+        throw new Error('Não foi possível salvar o tema neste navegador.')
+      }
+    }
+    if (themePreference === preference) {
+      preference.theme = savedTheme
+      preference.revision++
+      if (readerSession !== session) readerCleanup?.updateBook({ theme: savedTheme })
+    }
+    return savedTheme
+  })
+  preference.writeQueue = pending.catch(() => {})
+  return pending
+}
+
 function routedBook() {
   return /^#livro=([a-z0-9-]{1,64})$/i.exec(window.location.hash)?.[1]
 }
@@ -817,6 +873,8 @@ async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
       initialHighlightId,
       onExit: exitReader,
       palette: highlightPalette,
+      theme: themePreference.theme,
+      onChangeTheme: theme => saveReaderTheme(themePreference, theme, session),
       viewerId: account,
       onAddColor: account ? async color => {
         const { colors } = await api('/reader/colors', { method: 'POST', data: { color } })
@@ -885,7 +943,6 @@ async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
     recordReaderRoute(id)
     if (openingBook === controller) openingBook = undefined
     if (dialog.open && dialog.dataset.view === 'open-book') dialog.close()
-    themeColor?.setAttribute('content', '#ffffff')
     if (!session.preview && !sample && (pending.position || pending.highlights.length)) {
       void syncPendingReading(api, account, id).catch(error => { if (readerSession === session) announce(error.message) })
     }
@@ -1000,6 +1057,7 @@ dialog.addEventListener('click', async event => {
     user = null
     setBooks([])
     highlightPalette = []
+    setThemeAccount(null)
     dialog.close()
     renderShell()
   } catch (error) {
@@ -1013,7 +1071,10 @@ dialog.addEventListener('click', async event => {
 renderShell()
 try {
   user = (await api('/session')).user
-  if (user) void refreshPalette(user.id)
+  if (user) {
+    void refreshPalette(user.id)
+    setThemeAccount(user.id)
+  }
   try { await refreshBooks() } catch (error) { announce(error.message) }
   if (user && !readerBook) renderShell()
   await setupImports()

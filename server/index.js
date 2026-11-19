@@ -37,6 +37,7 @@ const dummySalt = randomBytes(16);
 const dummyKey = randomBytes(64);
 const presetColors = new Set(['yellow', 'green', 'pink']);
 const highlightScopes = new Set(['private', 'group']);
+const readerThemes = new Set(['classic', 'sepia', 'sand', 'sage', 'dusk', 'night']);
 const hostedResponses = new WeakSet();
 
 const storage = createStorage({ connectionString: process.env.DATABASE_URL, directory: dataDirectory });
@@ -443,6 +444,21 @@ async function saveReaderColor(request, response, userId) {
   return readerColors(response, userId);
 }
 
+async function readerTheme(response, userId) {
+  const preference = await storage.get('SELECT theme FROM reader_preferences WHERE user_id = ?', userId);
+  return respondJson(response, 200, { theme: preference?.theme ?? 'classic' });
+}
+
+async function saveReaderTheme(request, response, userId) {
+  const { theme } = await readJson(request);
+  if (!readerThemes.has(theme)) throw new HttpError(400, 'Tema de leitura inválido.');
+  await storage.run(`
+    INSERT INTO reader_preferences (user_id, theme) VALUES (?, ?)
+    ON CONFLICT (user_id) DO UPDATE SET theme = excluded.theme
+  `, userId, theme);
+  return respondJson(response, 200, { theme });
+}
+
 function highlightNote(value) {
   if (value === null) return '';
   if (typeof value !== 'string') throw new HttpError(400, 'Observação inválida.');
@@ -746,6 +762,12 @@ async function handleApi(request, response, pathname, searchParams, hosted) {
   }
   if (pathname === '/api/reader/colors' && method === 'POST') {
     return saveReaderColor(request, response, user.id);
+  }
+  if (pathname === '/api/reader/theme' && method === 'GET') {
+    return readerTheme(response, user.id);
+  }
+  if (pathname === '/api/reader/theme' && method === 'PUT') {
+    return saveReaderTheme(request, response, user.id);
   }
 
   if (pathname === '/api/books') {

@@ -40,7 +40,7 @@
 .lr-reader .lr-group-start,
 .lr-reader .lr-group-accept {
   border-color: var(--lr-accent);
-  color: #fff;
+  color: var(--lr-accent-ink, #fff);
   background: var(--lr-accent);
 }
 
@@ -155,7 +155,7 @@
   padding: 5px 4px;
   border-radius: 7px;
   color: var(--lr-accent);
-  background: #eef2ea;
+  background: var(--lr-peer-surface, #eef2ea);
   font-size: .8125rem;
   text-align: center;
 }
@@ -167,7 +167,7 @@
   place-items: center;
   justify-self: center;
   border-radius: 50%;
-  color: #fff;
+  color: var(--lr-accent-ink, #fff);
   background: var(--lr-accent);
   font-family: var(--lr-ui-font);
   font-size: .6875rem;
