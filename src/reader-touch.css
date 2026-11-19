@@ -1,0 +1,58 @@
+.lr-reader .lr-scroll {
+  touch-action: pinch-zoom;
+}
+
+.lr-paper {
+  -webkit-touch-callout: none;
+}
+
+.lr-scroll[data-input="touch"] .lr-paper,
+.lr-scroll[data-input="touch"] .lr-touch-visual {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+@media (pointer: coarse) {
+  .lr-scroll:not([data-input]) .lr-paper {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+}
+
+.lr-touch-visual {
+  position: fixed;
+  z-index: 3;
+  inset: 0;
+  pointer-events: none;
+}
+
+.lr-touch-shade {
+  position: absolute;
+  background: #8ebfdb74;
+  border-radius: 2px;
+}
+
+.lr-touch-handle {
+  position: absolute;
+  width: 28px;
+  height: 30px;
+  margin-left: -14px;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.lr-touch-measuring .lr-touch-handle {
+  pointer-events: none;
+}
+
+.lr-touch-handle::before {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 10px;
+  height: 10px;
+  content: '';
+  border-radius: 50%;
+  background: #456c80;
+  transform: translateX(-50%);
+}

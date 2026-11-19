@@ -74,8 +74,10 @@ async function saveJob(db, job, isNew = false) {
 const storePage = (db, page) => transact(db, ['pages'], 'readwrite', transaction =>
   value(transaction.objectStore('pages').put(page)))
 
-const loadPages = (db, jobId) => transact(db, ['pages'], 'readonly', transaction =>
-  value(transaction.objectStore('pages').index('byJob').getAll(jobId)))
+const loadPages = (db, jobId, start, end) => transact(db, ['pages'], 'readonly', transaction => {
+  const range = IDBKeyRange.bound([jobId, start], [jobId, end])
+  return value(transaction.objectStore('pages').getAll(range))
+})
 
 async function removeJob(db, accountId, id) {
   await transact(db, ['jobs', 'pages'], 'readwrite', async transaction => {
@@ -170,6 +172,16 @@ function resumeData(checkpoints) {
   return { pages, fallbackPages, thumbnail: checkpoints[0]?.thumbnail ?? null }
 }
 
+function appendCheckpoints(preview, checkpoints, persisted) {
+  for (const checkpoint of checkpoints) {
+    if (persisted && checkpoint.index === preview.storedPages) preview.storedPages++
+    if (checkpoint.index !== preview.pages.length) continue
+    preview.checkpoints.push(checkpoint)
+    preview.pages.push(checkpoint.page)
+    preview.pageCount = Math.max(preview.pageCount, checkpoint.total || 0, preview.pages.length)
+  }
+}
+
 export function createImportManager({ uploadBook, onChange, onComplete }) {
   const local = new Map()
   let channel
@@ -179,19 +191,54 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
   let context
   let current = null
 
+  function previewFor(scope) {
+    const id = scope.job.id
+    if (scope.preview?.id !== id) {
+      scope.preview = { id, pages: [], checkpoints: [], pageCount: 0, storedPages: 0 }
+    }
+    return scope.preview
+  }
+
+  async function syncPreview(scope, count = Number.MAX_SAFE_INTEGER) {
+    if (!scope.persisted || !scope.job) return
+    const preview = previewFor(scope)
+    while (preview.reading) await preview.reading
+    if (context !== scope || scope.job?.id !== preview.id || preview.storedPages >= count) return
+    const reading = loadPages(scope.db, preview.id, preview.storedPages, count - 1)
+    preview.reading = reading
+    try {
+      const checkpoints = await reading
+      if (scope.job?.id === preview.id) appendCheckpoints(preview, checkpoints, true)
+    } finally {
+      preview.reading = null
+    }
+  }
+
   function publish(scope, updates) {
     if (context !== scope) return
+    const preview = scope?.job && previewFor(scope)
     const next = updates && scope.job ? {
       id: scope.job.id,
       title: scope.job.title || scope.job.fileName,
       persistent: scope.persisted && !local.has(scope.accountId),
-      percent: current?.id === scope.job.id ? current.percent : 0,
+      percent: current?.id === scope.job.id ? current.percent :
+        preview.pageCount ? Math.floor(85 * preview.pages.length / preview.pageCount) : 0,
       error: null,
       ...updates,
+      pageCount: preview.pageCount,
+      loadedPages: preview.pages.length,
     } : null
     if (next === current || (next && current && Object.keys(next).every(key => next[key] === current[key]))) return
     current = next
     onChange(current)
+  }
+
+  function clearJob(scope, id) {
+    if (local.get(scope.accountId)?.job.id === id) local.delete(scope.accountId)
+    if (scope.job?.id !== id) return
+    scope.job = null
+    scope.preview = null
+    publish(scope, null)
   }
 
   function notify(scope, result) {
@@ -207,11 +254,13 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
 
   function sendProgress(scope) {
     if (context !== scope || !scope.executing || !current) return
-    const { id, status, phase, percent } = current
-    broadcast('progress', scope, id, { status, phase, percent })
+    const { id, status, phase, percent, pageCount } = current
+    const { storedPages } = previewFor(scope)
+    broadcast('progress', scope, id, { status, phase, percent, pageCount, storedPages })
   }
 
   function progress(scope, updates) {
+    if (context !== scope) return
     publish(scope, { ...updates, percent: Math.max(current?.percent || 0, updates.percent || 0) })
     if (scope.progressTimer || !scope.persisted) return
     scope.progressTimer = setTimeout(() => {
@@ -235,6 +284,13 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
     scope.job = saved || remembered?.job
     scope.persisted = Boolean(saved)
     if (remembered && scope.job?.id !== remembered.job.id) local.delete(scope.accountId)
+    if (scope.job) {
+      await syncPreview(scope).catch(() => {})
+      if (context !== scope || !scope.job) return
+      if (remembered?.job.id === scope.job.id) {
+        appendCheckpoints(previewFor(scope), remembered.checkpoints, false)
+      }
+    }
     if (scope.job?.failure?.retryOnSignIn) await clearFailure(scope).catch(() => {})
     if (context !== scope) return
     if (scope.job?.failure) showFailure(scope)
@@ -242,15 +298,10 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
   }
 
   async function processJob(scope, id, signal) {
-    const cached = local.get(scope.accountId)
     if (scope.persisted) {
       const saved = await loadJob(scope.db, scope.accountId)
       if (saved?.id !== id) {
-        if (scope.job?.id === id) {
-          scope.job = null
-          local.delete(scope.accountId)
-          publish(scope, null)
-        }
+        clearJob(scope, id)
         return
       }
       scope.job = saved
@@ -258,11 +309,11 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
     signal.throwIfAborted()
     if (scope.job.failure) return showFailure(scope)
 
-    const checkpoints = cached?.job.id === id ? cached.checkpoints :
-      scope.persisted ? await loadPages(scope.db, id) : []
-    const resume = resumeData(checkpoints)
-    checkpoints.length = resume.pages.length
-    let extractionTotal = checkpoints.at(-1)?.total || 0
+    await syncPreview(scope)
+    signal.throwIfAborted()
+    const preview = previewFor(scope)
+    const resume = resumeData(preview.checkpoints)
+    let extractionTotal = preview.pageCount
     const { job } = scope
     const file = job.file.name === job.fileName ? job.file :
       new File([job.file], job.fileName, { type: job.file.type, lastModified: job.lastModified })
@@ -279,6 +330,7 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
       onProgress({ stage, current: page, total, fraction = 0 }) {
         if (!total || signal.aborted) return
         extractionTotal = total
+        preview.pageCount = total
         const phase = stage === 'ocr' ? `Reconhecendo texto da página ${page} de ${total}…` :
           stage === 'complete' ? 'Preparando o envio…' : `Processando página ${page} de ${total}…`
         const percent = stage === 'complete' ? 85 : Math.floor(85 * (page - 1 + fraction) / total)
@@ -287,15 +339,20 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
       async onPage({ index, page, thumbnail, fallback }) {
         signal.throwIfAborted()
         const checkpoint = { jobId: id, index, page, thumbnail, fallback, total: extractionTotal }
-        checkpoints[index] = checkpoint
+        let persisted = false
         if (scope.persisted && !local.has(scope.accountId)) {
           try {
             await storePage(scope.db, checkpoint)
-            return
+            persisted = true
           } catch { /* Retain this session's progress if the browser cannot write more pages. */ }
         }
-        local.set(scope.accountId, { job, checkpoints })
-        progress(scope, { status: 'running', phase: current?.phase || 'Processando PDF…' })
+        appendCheckpoints(preview, [checkpoint], persisted)
+        if (!persisted) local.set(scope.accountId, { job, checkpoints: preview.checkpoints })
+        progress(scope, {
+          status: 'running', phase: current?.phase || 'Processando PDF…',
+          percent: extractionTotal ? Math.floor(85 * preview.pages.length / extractionTotal) : 0,
+        })
+        if (index === 0) sendProgress(scope)
       },
     })
 
@@ -320,9 +377,7 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
     }
 
     if (scope.persisted) await removeJob(scope.db, scope.accountId, id)
-    if (local.get(scope.accountId)?.job.id === id) local.delete(scope.accountId)
-    scope.job = null
-    publish(scope, null)
+    clearJob(scope, id)
     broadcast('complete', scope, id, { fallbackPages: document.fallbackPages })
     notify(scope, { id, book, fallbackPages: document.fallbackPages })
   }
@@ -370,7 +425,7 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
       detach()
       scope.worker = null
       scope.task = null
-      if (lostLease) launch(scope)
+      if (lostLease || (scope.job && scope.job.id !== id && !scope.job.failure)) launch(scope)
     })
   }
 
@@ -380,14 +435,22 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
     if (data.type === 'cancel' && scope.job?.id === data.jobId) scope.worker?.abort()
     if (data.type === 'watch' && scope.job?.id === data.jobId) sendProgress(scope)
     if (data.type === 'progress' && scope.job?.id === data.jobId && !scope.executing && !scope.discarding) {
-      publish(scope, { status: data.status, phase: data.phase, percent: data.percent })
+      const preview = previewFor(scope)
+      preview.pageCount = Math.max(preview.pageCount, data.pageCount || 0)
+      publish(scope, {
+        status: data.status, phase: data.phase,
+        percent: Math.max(current?.percent || 0, data.percent || 0),
+      })
+      if (data.storedPages > preview.storedPages) {
+        void syncPreview(scope, data.storedPages).then(() => {
+          if (context === scope && current?.id === data.jobId) publish(scope, current)
+        }).catch(() => {})
+      }
     }
     if (data.type === 'complete' || data.type === 'discard') {
       if (scope.job?.id === data.jobId) {
         scope.worker?.abort()
-        scope.job = null
-        local.delete(scope.accountId)
-        publish(scope, null)
+        clearJob(scope, data.jobId)
       }
       if (data.type === 'complete') notify(scope, { id: data.jobId, book: null, fallbackPages: data.fallbackPages ?? [] })
     }
@@ -422,6 +485,16 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
 
   return {
     get current() { return current },
+
+    getPreview(id) {
+      if (!id || context?.job?.id !== id) return null
+      const { pages, pageCount } = previewFor(context)
+      const { percent = 0, phase = 'Aguardando para processar…', status = 'waiting' } = current ?? {}
+      return {
+        id, title: context.job.title || context.job.fileName, pages, pageCount,
+        loading: { percent, phase, status },
+      }
+    },
 
     setAccount(accountId) {
       if (context && context.accountId === accountId) return context.loading
@@ -493,11 +566,7 @@ export function createImportManager({ uploadBook, onChange, onComplete }) {
         await scope.task
         await withLock(scope.db, scope.accountId, scope.signal, async () => {
           if (scope.persisted) await removeJob(scope.db, scope.accountId, id)
-          if (local.get(scope.accountId)?.job.id === id) local.delete(scope.accountId)
-          if (scope.job?.id === id) {
-            scope.job = null
-            publish(scope, null)
-          }
+          clearJob(scope, id)
           broadcast('discard', scope, id)
         })
       } catch (error) {

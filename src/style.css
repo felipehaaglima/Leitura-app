@@ -161,6 +161,12 @@ svg { width: 1.15rem; height: 1.15rem; flex: none; }
   margin-inline: auto;
   padding: 12px clamp(24px, 4vw, 58px) 0;
 }
+.import-summary-actions {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+}
+.import-summary-actions > .button { flex: none; }
 .import-summary-button {
   display: grid;
   width: 100%;
@@ -518,6 +524,7 @@ dialog::backdrop { background: #26322970; backdrop-filter: blur(2px); }
   .topbar { display: none; }
   .page-content { padding: 27px 16px 34px; }
   .import-summary { padding: 10px 16px 0; }
+  .import-summary-actions { flex-direction: column; gap: 6px; }
   .import-summary-button { gap: 8px; }
   .page-intro { margin-bottom: 19px; }
   .import-banner { min-height: 238px; }

@@ -1,5 +1,7 @@
 import "@fontsource/tinos/latin-400.css";
 import "./reader.css";
+import { paginatePage } from "./pagination.js";
+import { installReaderTouch } from "./reader-touch.js";
 
 const icons = {
   library: '<path d="M3 4h3v16H3zM9 4h3v16H9zM15 5l3-1 4 15-3 1z" />',
@@ -86,24 +88,65 @@ function selectionFragments(article, range) {
       ? textOffset(block, range.endContainer, range.endOffset)
       : text.length;
     if (end > start && text.slice(start, end).trim()) {
-      fragments.push({ block: Number(block.dataset.readerBlock), start, end, text: text.slice(start, end) });
+      const sourceStart = Number(block.dataset.readerStart);
+      fragments.push({
+        block: Number(block.dataset.readerBlock),
+        start: sourceStart + start,
+        end: sourceStart + end,
+        text: text.slice(start, end),
+      });
     }
   }
   return fragments;
 }
 
+function firstAnchor(part) {
+  return { block: part?.[0]?.block ?? 0, offset: part?.[0]?.start ?? 0 };
+}
+
+function partAt(parts, anchor) {
+  if (!anchor) return 0;
+  return Math.max(0, parts.findLastIndex((part) => {
+    const start = firstAnchor(part);
+    return start.block < anchor.block || (start.block === anchor.block && start.offset <= anchor.offset);
+  }));
+}
+
+function partSuffix(index) {
+  let suffix = "";
+  for (let value = index + 1; value > 0; value = Math.floor((value - 1) / 26)) {
+    suffix = String.fromCharCode(97 + ((value - 1) % 26)) + suffix;
+  }
+  return suffix;
+}
+
 export function renderReader(root, { book, onExit, onPosition, onAddHighlight, onRemoveHighlight }) {
-  const count = book.pages.length;
-  let page = Math.min(Math.max(Number.isInteger(book.position) ? book.position : 0, 0), Math.max(count - 1, 0));
+  let pages = book.pages ?? [];
+  let knownCount = book.pageCount;
+  let loading = book.loading ?? null;
+  const initialPage = Number.isInteger(book.position) && book.position >= 0 ? book.position : 0;
+  let page = pages[initialPage] ? initialPage : Math.max(0, pages.findIndex(Boolean));
+  let anchor = page === initialPage ? book.anchor : undefined;
+  let parts = [[]];
+  let part = 0;
+  let displayed;
+  let request = 0;
+  let layoutSize;
+  let layoutController = new AbortController();
+  const layouts = new Map();
   let highlights = [...(book.highlights ?? [])];
   let positionUpdates = Promise.resolve();
   let preferences = readPreferences();
   let controlsOpen = false;
   let selectionData;
+  let touchRange;
+  let touchControls;
   let activePanel;
   let tap;
   let tapTimer;
   let selectionTimer;
+  let menuTap;
+  let lastMenuTouch;
   let notificationTimer;
 
   const controller = new AbortController();
@@ -123,6 +166,7 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
       <article class="lr-paper" aria-label="Página de leitura"></article>
     </main>
     <footer class="lr-footer">
+      <span class="lr-loading" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden></span>
       <button type="button" class="lr-counter" aria-controls="lr-reader-tools lr-reader-navigation" aria-expanded="false"></button>
       <div class="lr-navigation" id="lr-reader-navigation" hidden>
         <progress aria-label="Progresso da leitura"></progress>
@@ -188,10 +232,7 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   const colors = find(".lr-colors");
   const colorToggle = find("[data-highlight-toggle]");
 
-  find(".lr-title").textContent = book.title;
-  find(".lr-title").title = book.title;
-  find(".lr-page-total").textContent = `de ${count}`;
-  progress.max = Math.max(count, 1);
+  displayTitle(book.title);
   if (book.source?.startsWith("https://pt.wikisource.org/wiki/")) {
     const source = find(".lr-source");
     source.href = book.source;
@@ -199,6 +240,11 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
     navigation.classList.add("lr-navigation-with-source");
   }
   root.replaceChildren(element);
+
+  function displayTitle(title) {
+    find(".lr-title").textContent = title;
+    find(".lr-title").title = title;
+  }
 
   function announce(message) {
     if (signal.aborted) return;
@@ -223,9 +269,12 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   }
 
   function displayCounter() {
-    const current = count ? page + 1 : 0;
-    counter.textContent = `${current} / ${count}`;
-    counter.setAttribute("aria-label", `Página ${current} de ${count}. ${controlsOpen ? "Ocultar" : "Mostrar"} controles de leitura`);
+    const total = pageTotal();
+    const current = displayed ? page + 1 : total === 0 ? 0 : "–";
+    const suffix = displayed && parts.length > 1 ? partSuffix(part) : "";
+    const label = suffix ? `Página ${current}, parte ${part + 1} de ${parts.length}` : `Página ${current}`;
+    counter.textContent = `${current}${suffix} / ${total ?? "…"}`;
+    counter.setAttribute("aria-label", `${label}${total === null ? "" : ` de ${total} páginas`}. ${controlsOpen ? "Ocultar" : "Mostrar"} controles de leitura`);
   }
 
   function showControls(open, moveFocus = false) {
@@ -265,31 +314,83 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
     colorToggle.setAttribute("aria-expanded", "false");
   }
 
-  function displayPage(keepScroll = false) {
-    if (!keepScroll) scroll.scrollTop = 0;
-    const current = book.pages[page];
+  function clearSelection() {
+    touchControls?.clear();
+    touchRange = null;
+    window.getSelection()?.removeAllRanges();
+    hideSelection();
+  }
+
+  function pageTotal() {
+    if (Number.isInteger(knownCount) && knownCount > 0) return knownCount;
+    return loading ? null : pages.length;
+  }
+
+  function displayLoading() {
+    const indicator = find(".lr-loading");
+    indicator.hidden = !loading;
+    if (!loading) return;
+
+    const stopped = loading.status === "error";
+    const percent = Number.isFinite(loading.percent) ? Math.round(Math.max(0, Math.min(100, loading.percent))) : null;
+    const label = stopped ? "Importação pausada" : "Importando";
+    indicator.textContent = percent === null ? label : `${label} ${percent}%`;
+    indicator.title = loading.phase || label;
+    indicator.setAttribute("aria-label", indicator.title);
+    if (percent === null) indicator.removeAttribute("aria-valuenow");
+    else indicator.setAttribute("aria-valuenow", String(percent));
+  }
+
+  function displayNavigation() {
+    const total = pageTotal();
+    const current = displayed ? page + 1 : 0;
+    find(".lr-page-total").textContent = `de ${total ?? "…"}`;
+    find('[data-step="-1"]').disabled = !displayed || (part === 0 && !pages[page - 1]);
+    find('[data-step="1"]').disabled = !displayed || (part === parts.length - 1 && !pages[page + 1]);
+    if (document.activeElement !== numberInput) numberInput.value = current;
+    numberInput.disabled = !displayed;
+    progress.max = Math.max(total ?? pages.length, 1);
+    progress.value = current;
+    const percentage = find(".lr-percent");
+    percentage.textContent = total ? `${Math.round(current / total * 100)}%` : "";
+    displayCounter();
+  }
+
+  function displayPage() {
     const blocks = document.createDocumentFragment();
     const pageHighlights = highlights.filter((item) => item.page === page);
 
-    for (const [index, block] of (current?.blocks ?? []).entries()) {
-      if (block.type === "text" && block.text.trim()) {
+    for (const slice of parts[part]) {
+      const block = displayed?.blocks[slice.block];
+      if (block?.type === "text") {
         const paragraph = document.createElement("p");
-        paragraph.dataset.readerBlock = index;
-        showAnnotations(paragraph, block.text, pageHighlights.filter((item) => item.block === index));
+        paragraph.dataset.readerBlock = slice.block;
+        paragraph.dataset.readerStart = slice.start;
+        const text = block.text.slice(slice.start, slice.end);
+        const annotations = pageHighlights
+          .filter((item) => item.block === slice.block && item.start < slice.end && item.end > slice.start)
+          .map((item) => ({
+            ...item,
+            start: Math.max(0, item.start - slice.start),
+            end: Math.min(text.length, item.end - slice.start),
+          }));
+        showAnnotations(paragraph, text, annotations);
         blocks.append(paragraph);
       }
-      if (block.type === "image") {
+      if (block?.type === "image") {
         const figure = document.createElement("figure");
         const image = document.createElement("img");
         image.src = block.src;
         image.alt = block.alt || `Ilustração da página ${page + 1}`;
         image.decoding = "async";
+        image.width = slice.width;
+        image.height = slice.height;
         figure.append(image);
         blocks.append(figure);
       }
     }
 
-    if (!blocks.hasChildNodes()) {
+    if (displayed && !blocks.hasChildNodes()) {
       const empty = document.createElement("p");
       empty.className = "lr-empty-page";
       empty.textContent = "Esta página não tem conteúdo para exibir.";
@@ -297,28 +398,77 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
     }
 
     article.replaceChildren(blocks);
-    article.setAttribute("aria-label", count ? `Página ${page + 1} de ${count}` : "Página de leitura");
-    find('[data-step="-1"]').disabled = page <= 0;
-    find('[data-step="1"]').disabled = page >= count - 1;
-    numberInput.value = count ? page + 1 : 0;
-    numberInput.disabled = !count;
-    progress.value = count ? page + 1 : 0;
-    find(".lr-percent").textContent = `${count ? Math.round((page + 1) / count * 100) : 0}%`;
-    displayCounter();
+    const partLabel = parts.length > 1 ? `, parte ${part + 1} de ${parts.length}` : "";
+    article.setAttribute("aria-label", displayed ? `Página ${page + 1}${partLabel}` : "Página de leitura");
+    displayNavigation();
   }
 
-  function goTo(next) {
-    const destination = Math.max(0, Math.min(next, count - 1));
-    if (!count || !Number.isInteger(destination) || destination === page) return;
+  function layoutFor(index, source) {
+    const previous = layouts.get(index);
+    if (previous?.source === source) return previous.promise;
+    const pending = { source, promise: paginatePage(source.blocks, article, { signal: layoutController.signal }) };
+    layouts.set(index, pending);
+    void pending.promise.catch(() => {
+      if (layouts.get(index) === pending) layouts.delete(index);
+    });
+    return pending.promise;
+  }
 
-    clearTimeout(tapTimer);
-    page = destination;
-    window.getSelection()?.removeAllRanges();
-    hideSelection();
-    displayPage();
-    positionUpdates = positionUpdates
-      .then(() => onPosition(destination))
-      .catch(() => announce("Não foi possível salvar sua posição."));
+  async function goTo(index, destination, { last = false, persist = true } = {}) {
+    const source = pages[index];
+    if (!source) {
+      if (persist && index >= 0 && (pageTotal() === null || index < pageTotal())) {
+        announce(loading ? "Esta página ainda está sendo importada." : "Esta página está indisponível.");
+      }
+      return;
+    }
+    const ticket = ++request;
+    article.setAttribute("aria-busy", "true");
+    try {
+      const nextParts = await layoutFor(index, source);
+      if (ticket !== request || signal.aborted) return;
+      const nextPart = last ? nextParts.length - 1 : partAt(nextParts, destination);
+      const nextAnchor = destination ?? firstAnchor(nextParts[nextPart]);
+      const moved = page !== index || anchor?.block !== nextAnchor.block || anchor?.offset !== nextAnchor.offset;
+
+      clearTimeout(tapTimer);
+      clearSelection();
+      page = index;
+      part = nextPart;
+      parts = nextParts;
+      anchor = nextAnchor;
+      displayed = source;
+      displayPage();
+      if (persist && moved) {
+        positionUpdates = positionUpdates
+          .then(() => onPosition(index, nextAnchor))
+          .catch(() => announce("Não foi possível salvar sua posição."));
+      }
+    } catch {
+      if (ticket === request && !signal.aborted) announce("Não foi possível preparar esta página.");
+    } finally {
+      if (ticket === request) article.removeAttribute("aria-busy");
+    }
+  }
+
+  function step(delta) {
+    if (!displayed) return;
+    const nextPart = part + delta;
+    if (parts[nextPart]) {
+      void goTo(page, firstAnchor(parts[nextPart]));
+    } else {
+      void goTo(page + delta, undefined, { last: delta < 0 });
+    }
+  }
+
+  function reflow() {
+    const size = `${article.clientWidth}:${article.clientHeight}:${preferences.size}`;
+    if (size === layoutSize) return;
+    layoutSize = size;
+    layoutController.abort();
+    layoutController = new AbortController();
+    layouts.clear();
+    void goTo(page, anchor, { persist: false });
   }
 
   function displayHighlights() {
@@ -347,10 +497,8 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
       excerpt.textContent = item.text;
       jump.append(label, excerpt);
       jump.addEventListener("click", () => {
-        goTo(item.page);
+        void goTo(item.page, { block: item.block, offset: item.start });
         showPanel(null, true);
-        article.querySelector(`[data-reader-block="${Number(item.block)}"]`)
-          ?.scrollIntoView({ block: "center" });
       });
 
       const remove = document.createElement("button");
@@ -364,7 +512,8 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
           await onRemoveHighlight(item.id);
           if (signal.aborted) return;
           highlights = highlights.filter((highlight) => highlight.id !== item.id);
-          displayPage(true);
+          clearSelection();
+          displayPage();
           displayHighlights();
           find('[data-panel="highlights"] .lr-panel-close').focus();
           announce("Destaque removido.");
@@ -383,26 +532,28 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
     const { offsetWidth: width, offsetHeight: height } = selectionMenu;
     const left = Math.min(window.innerWidth - width - inset, Math.max(inset, rect.left + rect.width / 2 - width / 2));
     const above = rect.top - height - inset;
-    const top = Math.min(window.innerHeight - height - inset, above >= inset ? above : rect.bottom + inset);
+    const below = rect.bottom + (touchRange ? 38 : inset);
+    const limit = window.innerHeight - height - inset;
+    const top = above >= inset ? above : below <= limit ? below : inset;
     selectionMenu.style.left = `${Math.max(inset, left)}px`;
     selectionMenu.style.top = `${Math.max(inset, top)}px`;
   }
 
-  function displaySelection() {
+  function displaySelection(range) {
     const selection = window.getSelection();
-    if (!selection?.rangeCount || selection.isCollapsed) {
+    const selectedRange = range ?? (selection?.rangeCount ? selection.getRangeAt(0) : null);
+    if (!selectedRange || selectedRange.collapsed) {
       hideSelection();
       return;
     }
-    const range = selection.getRangeAt(0);
-    if (!article.contains(range.startContainer) || !article.contains(range.endContainer)) {
+    if (!article.contains(selectedRange.startContainer) || !article.contains(selectedRange.endContainer)) {
       hideSelection();
       return;
     }
 
-    const fragments = selectionFragments(article, range);
-    const selectedText = selection.toString().trim();
-    const rect = range.getBoundingClientRect();
+    const fragments = selectionFragments(article, selectedRange);
+    const selectedText = fragments.map(({ text }) => text).join("\n").trim();
+    const rect = selectedRange.getBoundingClientRect();
     if (!fragments.length || !selectedText || rect.bottom < 0 || rect.top > window.innerHeight) {
       hideSelection();
       return;
@@ -427,8 +578,8 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
     if (event.detail === 0) showControls(!controlsOpen, true);
   }, { signal });
   element.addEventListener("click", async (event) => {
-    const step = event.target.closest("[data-step]");
-    if (step) goTo(page + Number(step.dataset.step));
+    const pageStep = event.target.closest("[data-step]");
+    if (pageStep) step(Number(pageStep.dataset.step));
 
     const trigger = event.target.closest("[data-toggle]");
     if (trigger) showPanel(activePanel === trigger.dataset.toggle ? null : trigger.dataset.toggle);
@@ -438,6 +589,7 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
     if (size) {
       preferences = { ...preferences, size: preferences.size + Number(size.dataset.size) };
       displayPreferences(true);
+      reflow();
     }
     if (event.target.closest("[data-highlight-toggle]") && selectionData) {
       colors.hidden = !colors.hidden;
@@ -450,8 +602,7 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
 
     const { page: markedPage, fragments } = selectionData;
     const color = colorChoice.dataset.color;
-    window.getSelection()?.removeAllRanges();
-    hideSelection();
+    clearSelection();
     const results = await Promise.allSettled(fragments.map((fragment) =>
       Promise.resolve().then(() => onAddHighlight({ ...fragment, page: markedPage, color })),
     ));
@@ -459,7 +610,10 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
 
     const saved = results.flatMap((result) => result.status === "fulfilled" && result.value?.id ? [result.value] : []);
     highlights.push(...saved);
-    if (page === markedPage) displayPage(true);
+    if (page === markedPage) {
+      clearSelection();
+      displayPage();
+    }
     displayHighlights();
     if (saved.length === fragments.length) {
       announce("Destaque salvo.");
@@ -474,8 +628,9 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   }, { signal });
 
   function jumpFromInput() {
-    if (/^\d+$/.test(numberInput.value)) goTo(Number(numberInput.value) - 1);
-    numberInput.value = count ? page + 1 : 0;
+    const input = numberInput.value;
+    numberInput.value = displayed ? page + 1 : 0;
+    if (/^\d+$/.test(input)) void goTo(Number(input) - 1);
   }
 
   find(".lr-page-form").addEventListener("submit", (event) => {
@@ -486,13 +641,34 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   numberInput.addEventListener("change", jumpFromInput, { signal });
   numberInput.addEventListener("focus", () => numberInput.select(), { signal });
 
+  function tapFraction(x) {
+    const bounds = scroll.getBoundingClientRect();
+    return (x - bounds.left) / bounds.width;
+  }
+
+  touchControls = installReaderTouch(scroll, {
+    article,
+    signal,
+    onSwipe: step,
+    onTap(x, target) {
+      if (!(target instanceof Element) || target.closest("a, button, input") || !selectionMenu.hidden) return;
+      const fraction = tapFraction(x);
+      if (fraction >= 0.25 && fraction <= 0.75) showControls(!controlsOpen);
+    },
+    onSelection(range) {
+      clearTimeout(selectionTimer);
+      touchRange = range;
+      if (range) displaySelection(range);
+      else hideSelection();
+    },
+  });
+
   scroll.addEventListener("pointerdown", (event) => {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || event.pointerType === "touch") return;
     tap = {
       id: event.pointerId,
       x: event.clientX,
       y: event.clientY,
-      type: event.pointerType,
       blocked: Boolean(activePanel) || !selectionMenu.hidden || !window.getSelection()?.isCollapsed,
     };
   }, { signal });
@@ -512,19 +688,19 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
     clearTimeout(tapTimer);
     const gesture = tap;
     tap = null;
-    if (event.defaultPrevented || event.button !== 0 || (gesture?.type !== "touch" && event.detail > 1) || gesture?.blocked ||
+    if (event.pointerType === "touch" || event.sourceCapabilities?.firesTouchEvents || scroll.dataset.input === "touch" ||
+        event.defaultPrevented || event.button !== 0 || event.detail > 1 || gesture?.blocked ||
         !selectionMenu.hidden || !window.getSelection()?.isCollapsed ||
-        event.target.closest("a, button, input, img, mark")) return;
+        event.target.closest("a, button, input")) return;
 
-    const bounds = scroll.getBoundingClientRect();
-    const fraction = (event.clientX - bounds.left) / bounds.width;
+    const fraction = tapFraction(event.clientX);
     if (!Number.isFinite(fraction) || fraction < 0 || fraction > 1) return;
     const readText = event.target.closest("[data-reader-block]");
     if (fraction < 0.25 || fraction > 0.75) {
-      if (!readText) goTo(page + (fraction > 0.75 ? 1 : -1));
+      if (!readText) step(fraction > 0.75 ? 1 : -1);
       return;
     }
-    if (readText && gesture?.type !== "touch") {
+    if (readText) {
       tapTimer = setTimeout(() => {
         if (window.getSelection()?.isCollapsed) showControls(!controlsOpen);
       }, 240);
@@ -534,13 +710,43 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   }, { signal });
 
   selectionMenu.addEventListener("mousedown", (event) => event.preventDefault(), { signal });
+  // After a selection drag, the browser can skip the click from the next tap.
+  selectionMenu.addEventListener("pointerdown", (event) => {
+    if (event.pointerType !== "touch") return;
+    const control = event.target.closest("button, a");
+    if (!control) return;
+    event.preventDefault();
+    menuTap = { control, id: event.pointerId, x: event.clientX, y: event.clientY };
+  }, { signal });
+  selectionMenu.addEventListener("pointerup", (event) => {
+    if (event.pointerId !== menuTap?.id) return;
+    const { control, x, y } = menuTap;
+    menuTap = null;
+    if (!control.contains(event.target) || Math.hypot(event.clientX - x, event.clientY - y) > 12) return;
+    lastMenuTouch = { control, at: performance.now() };
+    control.click();
+  }, { signal });
+  selectionMenu.addEventListener("pointercancel", () => { menuTap = null; }, { signal });
+  selectionMenu.addEventListener("click", (event) => {
+    if (!event.isTrusted || event.detail === 0 || !lastMenuTouch?.control.contains(event.target) ||
+        performance.now() - lastMenuTouch.at > 450) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, { signal, capture: true });
+  scroll.addEventListener("contextmenu", (event) => {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !article.contains(selection.anchorNode) ||
+        !article.contains(selection.focusNode)) return;
+    event.preventDefault();
+    displaySelection();
+  }, { signal });
   selectionMenu.addEventListener("click", (event) => {
     if (!event.target.closest("a")) return;
-    window.getSelection()?.removeAllRanges();
-    hideSelection();
+    clearSelection();
   }, { signal });
 
   document.addEventListener("selectionchange", () => {
+    if (touchRange) return;
     if (!window.getSelection()?.isCollapsed) clearTimeout(tapTimer);
     clearTimeout(selectionTimer);
     selectionTimer = setTimeout(displaySelection, 70);
@@ -554,36 +760,58 @@ export function renderReader(root, { book, onExit, onPosition, onAddHighlight, o
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       if (!selectionMenu.hidden) {
-        window.getSelection()?.removeAllRanges();
-        hideSelection();
+        clearSelection();
       } else if (activePanel) showPanel(null, true);
       else if (controlsOpen) showControls(false);
       return;
     }
     if (activePanel || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey ||
         (event.target instanceof Element && event.target.closest("input, textarea, select, [contenteditable]")) ||
-        !window.getSelection()?.isCollapsed) return;
+        touchRange || !window.getSelection()?.isCollapsed) return;
     if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
       event.preventDefault();
-      goTo(page + (event.key === "ArrowRight" ? 1 : -1));
+      step(event.key === "ArrowRight" ? 1 : -1);
     }
   }, { signal });
 
-  scroll.addEventListener("scroll", () => {
-    if (selectionData) displaySelection();
-  }, { signal, passive: true });
-  window.addEventListener("resize", () => {
-    if (selectionData) displaySelection();
-  }, { signal });
+  window.addEventListener("resize", reflow, { signal });
+  const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(reflow);
+  observer?.observe(article);
 
   displayPreferences();
   displayHighlights();
+  displayLoading();
   displayPage();
+  reflow();
 
-  return () => {
+  const cleanup = () => {
     controller.abort();
+    layoutController.abort();
+    observer?.disconnect();
     clearTimeout(tapTimer);
     clearTimeout(selectionTimer);
     clearTimeout(notificationTimer);
   };
+  cleanup.updateBook = ({ pages: nextPages, pageCount, loading: nextLoading, title, highlights: nextHighlights }) => {
+    if (signal.aborted) return;
+    if (nextPages) pages = nextPages;
+    if (pageCount !== undefined) knownCount = pageCount;
+    if (nextLoading !== undefined) loading = nextLoading;
+    if (title !== undefined) displayTitle(title);
+    displayLoading();
+    displayNavigation();
+    if (nextHighlights) {
+      highlights = [...nextHighlights];
+      clearSelection();
+      displayHighlights();
+      displayPage();
+    }
+    if (displayed !== pages[page]) {
+      void goTo(page, anchor, { persist: false });
+    } else if (!displayed) {
+      const first = pages.findIndex(Boolean);
+      if (first >= 0) void goTo(first, undefined, { persist: false });
+    }
+  };
+  return cleanup;
 }

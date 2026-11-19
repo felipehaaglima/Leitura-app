@@ -1,5 +1,9 @@
 import './style.css'
 import { createImportManager } from './import-jobs.js'
+import {
+  addPendingHighlight, clearPendingReading, pendingReading, removePendingHighlight,
+  savePendingPosition, syncPendingReading,
+} from './pending-reading.js'
 import { sampleBooks } from './samples.js'
 
 const app = document.querySelector('#app')
@@ -33,6 +37,7 @@ let filter = 'all'
 let query = ''
 let readerCleanup
 let readerBook
+let readerSession
 let readerRequest = 0
 let toastTimeout
 const imports = createImportManager({
@@ -229,7 +234,7 @@ async function renderHighlights() {
     const markedBooks = [...imported.values(), ...examples].filter(book => book.highlights.length)
     results.innerHTML = markedBooks.length
       ? markedBooks.map(book => `<section class="highlight-group"><h2>${escape(book.title)}</h2>${
-        book.highlights.map(mark => `<button type="button" class="highlight-entry" data-book="${escape(book.id)}" data-page="${mark.page}">
+        book.highlights.map(mark => `<button type="button" class="highlight-entry" data-book="${escape(book.id)}" data-page="${mark.page}" data-block="${mark.block}" data-offset="${mark.start}">
           <span class="swatch swatch-${escape(mark.color || 'yellow')}"></span>
           <span><q>${escape(mark.text)}</q><small>Página ${mark.page + 1}</small></span>${icon('chevron')}
         </button>`).join('')
@@ -246,6 +251,7 @@ function renderShell() {
   readerCleanup?.()
   readerCleanup = undefined
   readerBook = undefined
+  readerSession = undefined
   document.title = 'Margem — Biblioteca de leitura'
   const active = name => section === name ? 'aria-current="page"' : ''
   app.innerHTML = `<div class="shell">
@@ -273,10 +279,13 @@ function renderShell() {
       <header class="topbar"><p>${icon(section === 'library' ? 'library' : 'bookmark')} ${section === 'library' ? 'Biblioteca' : 'Destaques'}</p>
         <button class="button topbar-upload" type="button" data-action="upload">${icon('upload')} Importar PDF</button></header>
       <div id="import-summary" class="import-summary" hidden>
-        <button type="button" class="import-summary-button" data-action="upload" aria-haspopup="dialog">
-          <span class="import-summary-text"><strong data-import-state></strong><span data-import-title></span></span>
-          <progress max="100" value="0" aria-hidden="true"></progress><strong class="import-summary-percent" data-import-percent></strong>
-        </button>
+        <div class="import-summary-actions">
+          <button type="button" class="import-summary-button" data-action="upload" aria-haspopup="dialog">
+            <span class="import-summary-text"><strong data-import-state></strong><span data-import-title></span></span>
+            <progress max="100" value="0" aria-hidden="true"></progress><strong class="import-summary-percent" data-import-percent></strong>
+          </button>
+          <button class="button secondary" type="button" data-action="read-import-preview" hidden>${icon('library')} Ler páginas disponíveis</button>
+        </div>
       </div>
       ${section === 'library' ? libraryView() : `<div class="page-content highlights-page">
         <div class="page-intro"><h1>Seus destaques</h1><p>Volte aos trechos que você marcou.</p></div>
@@ -353,6 +362,7 @@ function updateImportProgress(job) {
       dialog.querySelector('[data-import-storage]').hidden = true
       dialog.querySelector('[data-action="retry-import"]').hidden = true
       dialog.querySelector('[data-action="discard-import"]').hidden = true
+      dialog.querySelector('[data-action="read-import-preview"]').hidden = true
     }
     return
   }
@@ -365,6 +375,15 @@ function updateImportProgress(job) {
     title.title = job.title
     summary.querySelector('[data-import-percent]').textContent = `${job.percent}%`
     summary.querySelector('progress').value = job.percent
+    summary.querySelector('[data-action="read-import-preview"]').hidden = !job.loadedPages
+  }
+
+  if (readerSession?.preview && readerBook?.id === job.id) {
+    const preview = imports.getPreview(job.id)
+    if (preview) {
+      readerBook = { ...readerBook, ...preview }
+      readerCleanup?.updateBook(preview)
+    }
   }
 
   if (!watching || dialog.dataset.importId !== job.id) return
@@ -377,6 +396,7 @@ function updateImportProgress(job) {
   dialog.querySelector('[data-import-storage]').hidden = job.persistent !== false
   dialog.querySelector('[data-action="retry-import"]').hidden = job.status !== 'error'
   dialog.querySelector('[data-action="discard-import"]').hidden = job.status !== 'error'
+  dialog.querySelector('[data-action="read-import-preview"]').hidden = !job.loadedPages
 }
 
 function showImportProgress() {
@@ -390,6 +410,7 @@ function showImportProgress() {
         <button class="button secondary" type="button" data-action="close-dialog">Continuar navegando</button>
         <button class="button secondary" type="button" data-action="discard-import" hidden>Descartar</button>
         <button class="button primary" type="button" data-action="retry-import" hidden>Tentar novamente</button>
+        <button class="button primary" type="button" data-action="read-import-preview" hidden>Ler páginas disponíveis</button>
       </div>
     </div>`, 'import-progress')
   dialog.dataset.importId = imports.current.id
@@ -441,6 +462,11 @@ async function setupImports() {
 
 async function finishUpload({ id, book, fallbackPages }, accountId) {
   if (user?.id !== accountId) return
+  const completedId = id ?? book?.id
+  const liveReader = readerBook?.id === completedId && readerSession?.preview ? readerSession : null
+  if (liveReader) liveReader.preview = false
+  const draft = pendingReading(accountId, completedId)
+  const sync = syncPendingReading(api, accountId, completedId).catch(error => announce(error.message))
   if (book) {
     books = [book, ...books.filter(item => item.id !== book.id)]
   } else {
@@ -448,6 +474,29 @@ async function finishUpload({ id, book, fallbackPages }, accountId) {
   }
   if (user?.id !== accountId) return
   renderBookList()
+  if (liveReader && readerSession === liveReader) {
+    try {
+      const item = book ?? books.find(item => item.id === completedId)
+      const pages = readerBook?.pages?.length === item?.pageCount ? readerBook.pages : (await loadBook(completedId)).pages
+      if (readerSession === liveReader) {
+        const patch = { pages, pageCount: pages.length, title: item?.title ?? readerBook.title, loading: null }
+        readerBook = { ...readerBook, ...patch }
+        readerCleanup?.updateBook(patch)
+      }
+    } catch (error) {
+      if (readerSession === liveReader) {
+        liveReader.preview = true
+        announce(error.message)
+      }
+    }
+  }
+  if (draft.position || draft.highlights.length) {
+    void sync.then(async () => {
+      if (user?.id !== accountId) return
+      await refreshBooks()
+      renderBookList()
+    }).catch(error => announce(error.message))
+  }
   const count = fallbackPages?.length ?? 0
   const message = count
     ? `PDF adicionado. ${count === 1 ? 'Uma página foi preservada como imagem.' : `${count} páginas foram preservadas como imagens.`}`
@@ -467,6 +516,7 @@ async function finishUpload({ id, book, fallbackPages }, accountId) {
 function showDeleteBook(id) {
   const book = books.find(item => item.id === id)
   if (!user || !book) return
+  const account = user.id
   readerRequest++
   showDialog('Apagar livro?', `
     <p class="modal-description"><strong>${escape(book.title)}</strong> será removido da sua biblioteca, junto com o progresso e os destaques dele.</p>
@@ -489,6 +539,7 @@ function showDeleteBook(id) {
         if (failure.status !== 404) throw failure
       })
       books = books.filter(item => item.id !== id)
+      clearPendingReading(account, id)
       if (dialog.open && dialog.contains(form)) dialog.close()
       renderBookList()
       announce('Livro apagado da biblioteca.')
@@ -511,32 +562,63 @@ async function refreshBooks() {
   if (account === user?.id) books = result
 }
 
-async function openBook(id, explicitPage) {
+function readAvailablePages() {
+  const job = imports.current
+  if (!job?.loadedPages) return
+  if (dialog.open) dialog.close()
+  void openBook(job.id)
+}
+
+async function loadSavedReading(id, account) {
+  await syncPendingReading(api, account, id).catch(error => announce(error.message))
+  return loadBook(id)
+}
+
+async function openBook(id, explicitPage, explicitAnchor) {
   const request = ++readerRequest
+  const account = user?.id
+  const sample = sampleBooks.find(book => book.id === id)
+  const preview = imports.getPreview(id)
+  if (preview && !preview.pages.length) return showImportProgress()
   try {
-    const sample = sampleBooks.find(book => book.id === id)
-    const [book, reader] = await Promise.all([
-      sample ? Promise.resolve(sample) : loadBook(id),
+    const [initial, reader] = await Promise.all([
+      sample ?? preview ?? loadSavedReading(id, account),
       import('./reader.js'),
     ])
-    if (request !== readerRequest) return
-    const account = user?.id
+    const book = preview ? imports.getPreview(id) ?? await loadSavedReading(id, account) : initial
+    if (request !== readerRequest || user?.id !== account) return
     const sampleProgress = sample ? sampleState(sample, account) : null
-    const position = explicitPage ?? (sample ? sampleProgress.position : book.currentPage)
-    const highlights = sample ? sampleProgress.highlights : book.highlights
-    const savePosition = async page => {
+    const pending = sample ? null : pendingReading(account, id)
+    const position = explicitPage ?? (sample ? sampleProgress.position : pending.position?.page ?? book.currentPage ?? 0)
+    const anchor = explicitAnchor ?? (explicitPage === undefined
+      ? (sample ? sampleProgress.anchor : pending.position?.anchor ?? book.anchor)
+      : null)
+    const marks = sample ? sampleProgress.highlights : (book.highlights ?? [])
+    const highlights = pending
+      ? [...marks, ...pending.highlights.filter(mark => !marks.some(item => item.id === mark.id))]
+      : marks
+    const session = { preview: Boolean(book.loading) }
+    const savePosition = async (page, nextAnchor = { block: 0, offset: 0 }) => {
       if (sample) {
         sampleProgress.position = page
+        sampleProgress.anchor = nextAnchor
         storeSample(sample, sampleProgress, account)
         return
       }
-      await api(`/books/${id}/progress`, { method: 'PATCH', data: { page } })
-      books = books.map(item => item.id === id ? { ...item, currentPage: page } : item)
+      if (user?.id !== account) return
+      if (session.preview) {
+        savePendingPosition(account, id, page, nextAnchor)
+        return
+      }
+      await syncPendingReading(api, account, id).catch(() => {})
+      await api(`/books/${id}/progress`, { method: 'PATCH', data: { page, anchor: nextAnchor } })
+      books = books.map(item => item.id === id ? { ...item, currentPage: page, anchor: nextAnchor } : item)
       if (!readerBook) renderBookList()
     }
 
     readerCleanup?.()
-    readerBook = { ...book, position, highlights }
+    readerSession = session
+    readerBook = { ...book, position, anchor, highlights }
     document.title = `${book.title} — Margem`
     readerCleanup = reader.renderReader(app, {
       book: readerBook,
@@ -552,6 +634,7 @@ async function openBook(id, explicitPage) {
           storeSample(sample, sampleProgress, account)
           return highlight
         }
+        if (session.preview) return addPendingHighlight(account, id, data)
         const { highlight } = await api(`/books/${id}/highlights`, { method: 'POST', data })
         books = books.map(item => item.id === id ? { ...item, highlightCount: (item.highlightCount ?? 0) + 1 } : item)
         return highlight
@@ -562,12 +645,20 @@ async function openBook(id, explicitPage) {
           storeSample(sample, sampleProgress, account)
           return
         }
-        await api(`/books/${id}/highlights/${highlightId}`, { method: 'DELETE' })
+        if (session.preview) {
+          removePendingHighlight(account, id, highlightId)
+          return
+        }
+        await syncPendingReading(api, account, id).catch(() => {})
+        await api(`/books/${id}/highlights/${highlightId}`, { method: 'DELETE' }).catch(error => {
+          if (error.status !== 404) throw error
+        })
+        removePendingHighlight(account, id, highlightId)
         books = books.map(item => item.id === id ? { ...item, highlightCount: Math.max(0, (item.highlightCount ?? 1) - 1) } : item)
       },
     })
     themeColor?.setAttribute('content', '#ffffff')
-    if (explicitPage !== undefined) void savePosition(explicitPage).catch(error => announce(error.message))
+    if (explicitPage !== undefined) void savePosition(explicitPage, explicitAnchor).catch(error => announce(error.message))
     window.scrollTo(0, 0)
   } catch (error) {
     announce(error.message)
@@ -577,11 +668,15 @@ async function openBook(id, explicitPage) {
 app.addEventListener('click', event => {
   const button = event.target.closest('button')
   if (!button) return
-  const { action, section: targetSection, book, deleteBook, page, filter: targetFilter } = button.dataset
+  const { action, section: targetSection, book, deleteBook, page, block, offset, filter: targetFilter } = button.dataset
   if (action === 'upload') showUpload()
+  if (action === 'read-import-preview') readAvailablePages()
   if (action === 'account') showAccount()
   if (deleteBook) showDeleteBook(deleteBook)
-  if (book) void openBook(book, page === undefined ? undefined : Number(page))
+  if (book) {
+    const anchor = block === undefined ? undefined : { block: Number(block), offset: Number(offset) }
+    void openBook(book, page === undefined ? undefined : Number(page), anchor)
+  }
   if (targetSection) {
     readerRequest++
     section = targetSection
@@ -608,6 +703,7 @@ dialog.addEventListener('click', async event => {
     dialog.close()
     void openBook(button.dataset.book)
   }
+  if (action === 'read-import-preview') readAvailablePages()
   if (action === 'retry-import' || action === 'discard-import') {
     button.disabled = true
     try {
@@ -615,8 +711,12 @@ dialog.addEventListener('click', async event => {
         await imports.retry()
       } else {
         const id = imports.current?.id
+        const account = user?.id
         await imports.discard()
-        if (id) await api(`/imports/${id}`, { method: 'DELETE' }).catch(() => {})
+        if (id) {
+          clearPendingReading(account, id)
+          await api(`/imports/${id}`, { method: 'DELETE' }).catch(() => {})
+        }
         if (dialog.open && dialog.contains(button)) dialog.close()
       }
     } catch (error) {

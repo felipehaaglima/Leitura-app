@@ -1,6 +1,10 @@
 import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+const progressColumns = ['current_block', 'current_offset'];
+const missingProgressColumns = (columns) => progressColumns.filter((name) => !columns.some((column) => column.name === name));
+const addProgressColumn = (name) => `ALTER TABLE books ADD COLUMN ${name} INTEGER NOT NULL DEFAULT 0`;
+
 const schema = `
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -25,6 +29,8 @@ const schema = `
     pages_json TEXT NOT NULL,
     page_count INTEGER NOT NULL,
     current_page INTEGER NOT NULL DEFAULT 0,
+    current_block INTEGER NOT NULL DEFAULT 0,
+    current_offset INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   ) TABLE_OPTION;
@@ -79,8 +85,17 @@ async function openSqlite(directory) {
   const { DatabaseSync } = await import('node:sqlite');
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const database = new DatabaseSync(resolve(directory, 'leitura.sqlite'));
-  database.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
-  database.exec(schema.replaceAll('BINARY_TYPE', 'BLOB').replaceAll('TIME_TYPE', 'INTEGER').replaceAll('TABLE_OPTION', 'STRICT'));
+  try {
+    database.exec('PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; BEGIN IMMEDIATE;');
+    database.exec(schema.replaceAll('BINARY_TYPE', 'BLOB').replaceAll('TIME_TYPE', 'INTEGER').replaceAll('TABLE_OPTION', 'STRICT'));
+    for (const name of missingProgressColumns(database.prepare('PRAGMA table_info(books)').all())) {
+      database.exec(addProgressColumn(name));
+    }
+    database.exec('COMMIT');
+  } catch (error) {
+    database.close();
+    throw error;
+  }
 
   const connection = sqliteConnection(database);
   let queue = Promise.resolve();
@@ -150,6 +165,11 @@ async function openPostgres(connectionString) {
     await transaction(async (connection) => {
       await connection.run('SELECT pg_advisory_xact_lock(418824069)');
       await connection.run(schema.replaceAll('BINARY_TYPE', 'BYTEA').replaceAll('TIME_TYPE', 'BIGINT').replaceAll('TABLE_OPTION', ''));
+      const columns = await connection.all(`
+        SELECT attname AS name FROM pg_attribute
+        WHERE attrelid = 'books'::regclass AND attnum > 0 AND NOT attisdropped
+      `);
+      for (const name of missingProgressColumns(columns)) await connection.run(addProgressColumn(name));
     });
   } catch (error) {
     await pool.end();

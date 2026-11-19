@@ -34,10 +34,11 @@ O servidor cria as tabelas na primeira operação que precisa do banco. Na Verce
 
 ## Leitura e dados
 
-- Toque nas laterais do leitor ou use as setas do teclado para avançar e voltar. Toque no centro para abrir os controles, incluindo o campo para ir a uma página.
-- Selecione uma palavra ou um trecho para destacar, consultar o Wikcionário ou abrir a tradução no Google Tradutor. Esses links enviam o termo ou o trecho selecionado ao serviço escolhido.
+- No celular, deslize para a esquerda para avançar e para a direita para voltar. Também é possível usar as setas do teclado. Toque no centro para abrir os controles. Páginas longas são divididas em partes como `1a`, `1b` e `1c`, ajustadas à tela.
+- No celular, pressione uma palavra para selecioná-la e arraste as alças para ampliar a seleção. Use o menu do Margem para destacar, consultar o Wikcionário ou abrir a tradução no Google Tradutor. Os links enviam o termo ou trecho selecionado ao serviço escolhido.
 - O PDF é processado no navegador. O Tesseract reconhece texto em português e inglês em páginas digitalizadas ou com uma camada de texto ilegível. O arquivo original permanece no dispositivo e o servidor recebe o texto e as imagens preparados para o leitor. Para recuperar um livro afetado por caracteres ilegíveis em uma importação anterior, importe novamente o PDF original.
 - A importação aceita PDFs de até 80 MB e 500 páginas. A recuperação de texto e figuras depende da qualidade do escaneamento e do layout. Páginas em que o OCR não encontra texto legível podem aparecer como imagem.
 - PDFs importados, destaques e última página são salvos por conta. O progresso do acervo aberto e as preferências do leitor ficam no navegador.
 - A porcentagem da importação fica visível na biblioteca depois de fechar a janela de importação. Com a aba aberta, o processamento segue em segundo plano. Ao voltar no mesmo navegador após fechar a aba ou recarregar a página, a importação retoma a partir do progresso salvo. O arquivo usado na retomada fica temporariamente no navegador e é removido ao concluir ou descartar a importação.
+- Use **Ler páginas disponíveis** assim que a primeira página estiver pronta. As próximas aparecem no leitor conforme forem processadas. O progresso e os destaques dessa leitura são salvos no livro ao concluir a importação.
 - Use a lixeira no cartão de um PDF para apagá-lo da biblioteca. A confirmação também remove o progresso e os destaques daquele livro.

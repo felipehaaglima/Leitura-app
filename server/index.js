@@ -25,7 +25,7 @@ const maxPartBytes = 3_100_000;
 const maxHostedJsonBytes = 4_000_000;
 const maxImportParts = Math.ceil(maxBookBytes / (chunkSize - 1));
 const importDuration = 2 * 60 * 60 * 1000;
-const importIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const deletedImport = 2;
 const bookBatchSize = 6;
 const highlightBatchSize = 48;
@@ -46,6 +46,7 @@ function prepare(sql) {
 
 const summaryFields = `
   id, title, thumbnail, page_count AS "pageCount", current_page AS "currentPage",
+  current_block AS "currentBlock", current_offset AS "currentOffset",
   created_at AS "createdAt", updated_at AS "updatedAt",
   CAST((SELECT count(*) FROM highlights WHERE highlights.book_id = books.id) AS INTEGER) AS "highlightCount"
 `;
@@ -56,8 +57,13 @@ const insertBookSql = `
 `;
 const bookSummarySql = `SELECT ${summaryFields} FROM books WHERE id = ? AND owner_id = ?`;
 const listBooksSql = `SELECT ${summaryFields} FROM books WHERE owner_id = ? ORDER BY updated_at DESC, id`;
+const updateProgressSql = `
+  UPDATE books SET current_page = ?, current_block = ?, current_offset = ?, updated_at = ?
+  WHERE id = ? AND owner_id = ? AND page_count > ?
+`;
+const highlightFields = 'id, page, block, "start", "end", text, color, created_at AS "createdAt"';
 const listHighlightsSql = `
-  SELECT id, page, block, "start", "end", text, color, created_at AS "createdAt"
+  SELECT ${highlightFields}
   FROM highlights WHERE book_id = ? ORDER BY page, block, "start", created_at, id
 `;
 const listAccountHighlightsSql = `
@@ -68,9 +74,11 @@ const listAccountHighlightsSql = `
   ORDER BY books.updated_at DESC, books.id, page, block, "start", highlights.created_at, highlights.id
 `;
 const getBlockSql = storage.postgres
-  ? `SELECT (pages_json::jsonb -> (?::integer) -> 'blocks' -> (?::integer))::text AS block
+  ? `SELECT ((pages_json::jsonb -> (?::integer) -> 'blocks' -> (?::integer)) - 'src'::text)::text AS block,
+            page_count AS "pageCount"
      FROM books WHERE id = ? AND owner_id = ?${storage.forUpdate}`
-  : 'SELECT json_extract(pages_json, ?) AS block FROM books WHERE id = ? AND owner_id = ?';
+  : `SELECT json_remove(json_extract(pages_json, ?), '$.src') AS block, page_count AS "pageCount"
+     FROM books WHERE id = ? AND owner_id = ?`;
 
 const queries = {
   userByEmail: prepare('SELECT * FROM users WHERE email = ?'),
@@ -87,10 +95,7 @@ const queries = {
   getBookSummary: prepare(bookSummarySql),
   getBookMetadata: prepare(`SELECT ${summaryFields}, length(pages_json) AS "dataLength" FROM books WHERE id = ? AND owner_id = ?`),
   getBookChunk: prepare('SELECT substr(pages_json, ?, ?) AS chunk FROM books WHERE id = ? AND owner_id = ?'),
-  updateProgress: prepare(`
-    UPDATE books SET current_page = ?, updated_at = ?
-    WHERE id = ? AND owner_id = ? AND page_count > ?
-  `),
+  getBookPageCount: prepare('SELECT page_count AS "pageCount" FROM books WHERE id = ? AND owner_id = ?'),
   deleteHighlight: prepare(`
     DELETE FROM highlights
     WHERE id = ? AND book_id IN (SELECT id FROM books WHERE id = ? AND owner_id = ?)
@@ -304,6 +309,10 @@ function sanitizeBlock(block) {
   throw new HttpError(400, 'O livro contém um trecho em formato inválido.');
 }
 
+function formatBookSummary({ currentBlock, currentOffset, ...summary }) {
+  return { ...summary, anchor: { block: currentBlock, offset: currentOffset } };
+}
+
 async function saveBook(connection, id, userId, body) {
   const title = typeof body.title === 'string' ? cleanText(body.title.trim()) : '';
   if (!title || title.length > 300) throw new HttpError(400, 'Informe um título de até 300 caracteres.');
@@ -326,7 +335,7 @@ async function saveBook(connection, id, userId, body) {
 
   const now = new Date().toISOString();
   await connection.run(insertBookSql, id, userId, title, thumbnail, JSON.stringify(pages), pages.length, now, now);
-  return connection.get(bookSummarySql, id, userId);
+  return formatBookSummary(await connection.get(bookSummarySql, id, userId));
 }
 
 function notFound() {
@@ -334,12 +343,31 @@ function notFound() {
 }
 
 async function saveProgress(request, response, bookId, userId) {
-  const { page } = await readJson(request);
+  const { page, anchor = { block: 0, offset: 0 } } = await readJson(request);
+  const { block, offset } = anchor ?? {};
   if (!Number.isSafeInteger(page) || page < 0 || page >= 2_000) throw new HttpError(400, 'Página inválida.');
+  if (!Number.isSafeInteger(block) || block < 0 || block >= 1_000
+      || !Number.isSafeInteger(offset) || offset < 0 || offset > 250_000) {
+    throw new HttpError(400, 'Posição de leitura inválida.');
+  }
 
-  const result = await queries.updateProgress.run(page, new Date().toISOString(), bookId, userId, page);
+  const update = (connection) => connection.run(
+    updateProgressSql, page, block, offset, new Date().toISOString(), bookId, userId, page,
+  );
+  // Page-only progress and an anchor at the page start need no PDF content lookup.
+  const result = block || offset ? await storage.transaction(async (connection) => {
+    const row = await getBookBlock(connection, page, block, bookId, userId);
+    if (!row) throw notFound();
+    if (page >= row.pageCount) throw new HttpError(400, 'Página inválida.');
+    const target = row.block ? JSON.parse(row.block) : null;
+    if (!target || (offset > 0 && (target.type !== 'text'
+        || offset > target.text.length || splitsSurrogate(target.text, offset)))) {
+      throw new HttpError(400, 'Posição de leitura inválida.');
+    }
+    return update(connection);
+  }) : await update(storage);
   if (result.changes === 0) {
-    if (!await queries.getBookSummary.get(bookId, userId)) throw notFound();
+    if (!await queries.getBookPageCount.get(bookId, userId)) throw notFound();
     throw new HttpError(400, 'Página inválida.');
   }
   respondJson(response, 200, { ok: true });
@@ -351,30 +379,46 @@ function splitsSurrogate(text, offset) {
   return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
 }
 
+function getBookBlock(connection, page, block, bookId, userId) {
+  const location = storage.postgres ? [page, block] : [`$[${page}].blocks[${block}]`];
+  return connection.get(getBlockSql, ...location, bookId, userId);
+}
+
 async function saveHighlight(request, response, bookId, userId) {
-  const { page, block, start, end, color = 'yellow' } = await readJson(request);
+  const { id: clientId, page, block, start, end, color = 'yellow' } = await readJson(request);
   if (![page, block, start, end].every((number) => Number.isSafeInteger(number) && number >= 0)
       || page >= 2_000 || block >= 1_000 || start >= end || end - start > 10_000 || !colors.has(color)) {
     throw new HttpError(400, 'Seleção de texto inválida.');
   }
+  if (clientId !== undefined && (typeof clientId !== 'string' || !uuidPattern.test(clientId))) {
+    throw new HttpError(400, 'Identificador de destaque inválido.');
+  }
 
-  const blockLocation = storage.postgres ? [page, block] : [`$[${page}].blocks[${block}]`];
   const highlight = await storage.transaction(async (connection) => {
-    const row = await connection.get(getBlockSql, ...blockLocation, bookId, userId);
+    const row = await getBookBlock(connection, page, block, bookId, userId);
     if (!row) throw notFound();
     const target = row.block ? JSON.parse(row.block) : null;
     if (target?.type !== 'text' || end > target.text.length
         || splitsSurrogate(target.text, start) || splitsSurrogate(target.text, end)) {
       throw new HttpError(400, 'Seleção de texto inválida.');
     }
-    const text = target.text.slice(start, end);
+    const text = cleanText(target.text.slice(start, end));
     if (!text.trim()) throw new HttpError(400, 'Selecione uma palavra ou frase.');
 
-    const id = randomUUID();
+    const id = clientId?.toLowerCase() ?? randomUUID();
     const createdAt = new Date().toISOString();
-    await connection.run('INSERT INTO highlights VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      id, bookId, page, block, start, end, cleanText(text), color, createdAt);
-    return { id, page, block, start, end, text, color, createdAt };
+    const inserted = await connection.run(`
+      INSERT INTO highlights VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (id) DO NOTHING
+    `, id, bookId, page, block, start, end, text, color, createdAt);
+    if (inserted.changes) return { id, page, block, start, end, text, color, createdAt };
+
+    const existing = await connection.get(
+      `SELECT ${highlightFields} FROM highlights WHERE id = ? AND book_id = ?`, id, bookId,
+    );
+    if (existing?.page === page && existing.block === block && existing.start === start
+        && existing.end === end && existing.text === text && existing.color === color) return existing;
+    throw new HttpError(409, 'Não foi possível usar este identificador de destaque.');
   });
   respondJson(response, 201, { highlight });
 }
@@ -395,7 +439,7 @@ async function startImport(request, response, userId) {
   if (!Number.isSafeInteger(partCount) || partCount < 1 || partCount > maxImportParts) {
     throw new HttpError(400, 'Quantidade de partes inválida.');
   }
-  if (clientId !== undefined && (typeof clientId !== 'string' || !importIdPattern.test(clientId))) {
+  if (clientId !== undefined && (typeof clientId !== 'string' || !uuidPattern.test(clientId))) {
     throw new HttpError(400, 'Identificador de importação inválido.');
   }
 
@@ -419,7 +463,7 @@ async function startImport(request, response, userId) {
     }
 
     const book = await connection.get(bookSummarySql, id, userId);
-    if (book) return { status: 200, body: { id, book, receivedParts: [] } };
+    if (book) return { status: 200, body: { id, book: formatBookSummary(book), receivedParts: [] } };
     if (item && item.expires_at > now) throw notFound();
     if (await connection.get('SELECT id FROM books WHERE id = ?', id)) throw importConflict();
 
@@ -482,7 +526,7 @@ async function completeImport(response, importId, userId) {
     if (item?.completed === deletedImport) throw notFound();
     if (!item || item.completed || item.expires_at <= Date.now()) {
       const existing = await connection.get(bookSummarySql, importId, userId);
-      if (existing) return existing;
+      if (existing) return formatBookSummary(existing);
       if (item?.completed) throw notFound();
       throw importNotFound();
     }
@@ -563,11 +607,11 @@ async function handleApi(request, response, pathname, searchParams, hosted) {
   if (pathname === '/api/books') {
     if (method === 'GET') {
       const { rows, nextOffset } = await listRows(listBooksSql, user.id, searchParams, bookBatchSize, hosted);
-      return respondJson(response, 200, { books: rows, nextOffset });
+      return respondJson(response, 200, { books: rows.map(formatBookSummary), nextOffset });
     }
     if (method === 'POST') {
       const body = await readJson(request, hosted ? maxHostedJsonBytes : maxBookBytes);
-      const book = await saveBook(storage, randomUUID(), user.id, body);
+      const book = await storage.transaction((connection) => saveBook(connection, randomUUID(), user.id, body));
       return respondJson(response, 201, { book });
     }
   }
@@ -598,13 +642,15 @@ async function handleApi(request, response, pathname, searchParams, hosted) {
       const { dataLength, ...summary } = row;
       const { rows, nextOffset } = await listRows(listHighlightsSql, bookId, new URLSearchParams({ offset: '0' }), highlightBatchSize, true);
       const partCount = Math.ceil(dataLength / chunkSize);
-      return respondJson(response, 200, { book: { ...summary, partCount, highlights: rows, nextHighlightOffset: nextOffset } });
+      return respondJson(response, 200, {
+        book: { ...formatBookSummary(summary), partCount, highlights: rows, nextHighlightOffset: nextOffset },
+      });
     }
     const row = await queries.getBook.get(bookId, user.id);
     if (!row) throw notFound();
     const { pages_json: pages, ...summary } = row;
     return respondJson(response, 200, {
-      book: { ...summary, pages: JSON.parse(pages), highlights: await storage.all(listHighlightsSql, bookId) },
+      book: { ...formatBookSummary(summary), pages: JSON.parse(pages), highlights: await storage.all(listHighlightsSql, bookId) },
     });
   }
   if (!resource && method === 'DELETE') {

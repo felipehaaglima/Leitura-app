@@ -23,7 +23,7 @@
   width: 100%;
   height: 100vh;
   height: 100dvh;
-  min-height: 300px;
+  min-height: 0;
   overflow: hidden;
   color: var(--lr-ink);
   background: var(--lr-paper);
@@ -146,20 +146,21 @@
 }
 
 .lr-scroll {
+  display: flex;
   flex: 1 1 auto;
   min-height: 0;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  touch-action: manipulation;
+  overflow: clip;
   margin: 0;
   padding: clamp(48px, 8vh, 96px) var(--lr-gutter) 32px;
-  scrollbar-width: none;
 }
 
 .lr-paper {
+  display: flow-root;
   width: 100%;
   max-width: var(--lr-paper-width);
-  min-height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: clip;
   margin: 0 auto;
   background: var(--lr-paper);
 }
@@ -189,7 +190,6 @@
 .lr-paper img {
   display: block;
   max-width: 100%;
-  max-height: 75vh;
   margin: 0 auto;
   object-fit: contain;
   border-radius: 3px;
@@ -246,6 +246,16 @@
   font-family: var(--lr-reading-font);
   font-size: .9375rem;
   font-variant-numeric: tabular-nums;
+}
+
+.lr-loading {
+  position: absolute;
+  left: clamp(12px, 4vw, 60px);
+  max-width: calc(50% - 48px);
+  color: var(--lr-muted);
+  font-size: .8125rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
 }
 
 .lr-navigation {
