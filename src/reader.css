@@ -671,6 +671,12 @@
   gap: 6px;
 }
 
+.lr-selection-extras {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
 .lr-reader .lr-selection-scope button,
 .lr-reader .lr-add-note {
   display: inline-flex;

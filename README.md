@@ -43,7 +43,7 @@ O servidor cria as tabelas na primeira operação que precisa do banco. Na Verce
 - A porcentagem da importação fica visível na biblioteca depois de fechar a janela de importação. Com a aba aberta, o processamento segue em segundo plano. Ao voltar no mesmo navegador após fechar a aba ou recarregar a página, a importação retoma a partir do progresso salvo. O arquivo usado na retomada fica temporariamente no navegador e é removido ao concluir ou descartar a importação.
 - Use **Ler páginas disponíveis** assim que a primeira página estiver pronta. As próximas aparecem no leitor conforme forem processadas. O progresso e os destaques dessa leitura são salvos no livro ao concluir a importação.
 - Use a lixeira no cartão de um PDF para apagá-lo da biblioteca. A confirmação também remove o progresso e os destaques daquele livro.
-- O destaque oferece três cores iniciais. Em **Aparência**, adicione outras cores à sua conta. Para anotar um trecho, escolha **Adicionar nota** ao selecionar o texto ou edite uma nota nos destaques do leitor.
+- O destaque oferece três cores iniciais. Em **Aparência** ou no menu de destaque, adicione outras cores à sua conta. Para anotar um trecho, escolha **Adicionar nota** ao selecionar o texto ou edite uma nota nos destaques do leitor.
 
 ## Social
 

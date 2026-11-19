@@ -251,7 +251,10 @@ export function renderReader(root, {
           <button type="button" data-highlight-scope="private" aria-pressed="true">Pessoal</button>
           <button type="button" data-highlight-scope="group" aria-pressed="false">Grupo</button>
         </div>
-        <button type="button" class="lr-add-note" data-note-create hidden>${icon("note")} Adicionar nota</button>
+        <div class="lr-selection-extras">
+          <button type="button" class="lr-add-note" data-note-create hidden>${icon("note")} Adicionar nota</button>
+          <button type="button" class="lr-add-note" data-add-selection-color hidden>Adicionar cor</button>
+        </div>
       </div>
     </div>
     <dialog class="lr-editor" aria-labelledby="lr-editor-title">
@@ -420,6 +423,7 @@ export function renderReader(root, {
     find(".lr-colors").replaceChildren(swatches);
     find(".lr-palette-preview").replaceChildren(preview);
     find("[data-add-color]").hidden = !onAddColor;
+    find("[data-add-selection-color]").hidden = !onAddColor;
     find("[data-note-create]").hidden = !onUpdateHighlight;
     if (!colors.hidden && selectionData) positionSelection(selectionData.rect);
   }
@@ -733,6 +737,7 @@ export function renderReader(root, {
     find(".lr-note-color").hidden = editing;
     editorError.hidden = true;
     editorSave.disabled = false;
+    editorSave.textContent = colorMode && draft.selection ? "Salvar e destacar" : "Salvar";
     note.value = draft.item?.note ?? "";
     noteScope.value = draft.item?.scope === "group" || draft.scope === "group" ? "group" : "private";
     if (!colorMode && !editing) {
@@ -779,12 +784,16 @@ export function renderReader(root, {
       const memo = note.value.trim();
       if (draft.kind === "color") {
         const hex = customColor.value.toLowerCase();
-        if (customColors.includes(hex)) throw new Error("Essa cor já está na paleta.");
-        const updated = await onAddColor(hex);
-        if (signal.aborted) return;
-        customColors = normalizePalette(updated ?? [...customColors, hex]);
-        displayPalette();
-        announce("Cor adicionada à paleta.");
+        if (!customColors.includes(hex)) {
+          const updated = await onAddColor(hex);
+          if (signal.aborted) return;
+          customColors = normalizePalette(updated ?? [...customColors, hex]);
+          displayPalette();
+        } else if (!draft.selection) {
+          throw new Error("Essa cor já está na paleta.");
+        }
+        if (draft.selection) await saveSelection(draft.selection, hex, draft.scope);
+        else announce("Cor adicionada à paleta.");
       } else if (draft.kind === "edit") {
         const patch = { note: memo, ...(groupActive ? { scope: noteScope.value } : {}) };
         const saved = await onUpdateHighlight(draft.item.id, patch);
@@ -902,6 +911,10 @@ export function renderReader(root, {
     if (scopeChoice && groupActive && selectionData) {
       selectedScope = scopeChoice.dataset.highlightScope;
       displayScope();
+      return;
+    }
+    if (event.target.closest("[data-add-selection-color]") && onAddColor && selectionData) {
+      openEditor({ kind: "color", selection: selectionData, scope: groupActive ? selectedScope : "private" });
       return;
     }
     if (event.target.closest("[data-note-create]") && selectionData) {
