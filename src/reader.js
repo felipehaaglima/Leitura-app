@@ -131,6 +131,7 @@ export function renderReader(root, {
   book, onExit, onPosition, onAddHighlight, onRemoveHighlight, loadPage,
   palette, onAddColor, onUpdateHighlight, viewerId, onLoadGroup, onStartGroup, onRespondGroup,
   loadNotes, addNote, updateNote, deleteNote, initialHighlightId, theme, onChangeTheme,
+  offline = false, onRetryConnection,
 }) {
   let pages = book.pages ?? [];
   let knownCount = book.pageCount;
@@ -197,6 +198,7 @@ export function renderReader(root, {
     <footer class="lr-footer">
       <span class="lr-loading" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden></span>
       <button type="button" class="lr-counter" aria-controls="lr-reader-tools lr-reader-navigation" aria-expanded="false"></button>
+      <span class="lr-offline" role="status"></span>
       <div class="lr-navigation" id="lr-reader-navigation" hidden>
         <progress aria-label="Progresso da leitura"></progress>
         <a class="lr-source" target="_blank" rel="noopener noreferrer" hidden>Ler obra completa na Wikisource</a>
@@ -296,6 +298,7 @@ export function renderReader(root, {
   const article = find(".lr-paper");
   const header = find(".lr-header");
   const counter = find(".lr-counter");
+  const connectionStatus = find(".lr-offline");
   const navigation = find(".lr-navigation");
   const pageAlert = find(".lr-page-alert");
   const pageMessage = pageAlert.querySelector("span");
@@ -692,6 +695,10 @@ export function renderReader(root, {
     if (message) status.textContent = "";
   }
 
+  function retryPageLoad() {
+    if (retryPage) void goTo(retryPage.index, retryPage.destination, retryPage);
+  }
+
   async function goTo(index, destination, { last = false, persist = true } = {}) {
     if (persist) pendingHighlightId = null;
     if (!canOpen(index)) {
@@ -704,7 +711,8 @@ export function renderReader(root, {
     const ticket = ++request;
     if (pageLoad && pageLoad.index !== index) cancelPageLoad();
     const cached = pages[index];
-    showPageAlert(!cached || (!displayed && !loading) ? `Carregando página ${index + 1}…` : "");
+    const keepOfflineAlert = retryPage?.offline && !persist && displayed && index === page;
+    if (!keepOfflineAlert) showPageAlert(!cached || (!displayed && !loading) ? `Carregando página ${index + 1}…` : "");
     article.setAttribute("aria-busy", "true");
     try {
       const source = cached ?? await requestPage(index);
@@ -725,15 +733,19 @@ export function renderReader(root, {
       displayed = source;
       displayPage();
       groupControls?.showPage();
-      showPageAlert("");
+      if (!keepOfflineAlert) showPageAlert("");
       if (persist && moved) {
         positionUpdates = positionUpdates
           .then(() => onPosition(index, nextAnchor))
           .catch(() => announce("Não foi possível salvar sua posição."));
       }
-    } catch {
+    } catch (error) {
       if (ticket === request && !signal.aborted) {
-        showPageAlert(`Não foi possível abrir a página ${index + 1}.`, { index, destination, last, persist });
+        const unavailableOffline = error?.code === "OFFLINE_PAGE";
+        const message = unavailableOffline
+          ? `A página ${index + 1} ainda não está disponível offline. Conecte-se para carregar.`
+          : `Não foi possível abrir a página ${index + 1}.`;
+        showPageAlert(message, { index, destination, last, persist, offline: unavailableOffline });
       }
     } finally {
       if (ticket === request) article.removeAttribute("aria-busy");
@@ -923,9 +935,8 @@ export function renderReader(root, {
 
   find(".lr-back").addEventListener("click", onExit, { signal });
   pageRetry.addEventListener("click", () => {
-    if (!retryPage) return;
-    const { index, destination, last, persist } = retryPage;
-    void goTo(index, destination, { last, persist });
+    if (offline && retryPage?.offline && onRetryConnection) onRetryConnection();
+    else retryPageLoad();
   }, { signal });
   counter.addEventListener("click", (event) => {
     if (event.detail === 0) showControls(!controlsOpen, true);
@@ -1183,7 +1194,7 @@ export function renderReader(root, {
     signal,
     viewerId,
     getPage: () => displayed ? page : null,
-    loadGroup: onLoadGroup,
+    loadGroup: offline ? undefined : onLoadGroup,
     startGroup: onStartGroup,
     respondGroup: onRespondGroup,
     comparePeer(member) {
@@ -1207,6 +1218,7 @@ export function renderReader(root, {
   displayPalette();
   displayHighlights();
   displayLoading();
+  connectionStatus.textContent = offline ? "Sem conexão" : "";
   displayPage();
   reflow();
 
@@ -1224,13 +1236,24 @@ export function renderReader(root, {
   cleanup.updateBook = ({
     pages: nextPages, pageCount, loading: nextLoading, title, highlights: nextHighlights,
     loadPage: nextLoader, additionalHighlights, palette: nextPalette, onLoadGroup: nextGroupLoader, theme: nextTheme,
+    offline: nextOffline,
   }) => {
     if (signal.aborted) return;
     if (nextPages) pages = nextPages;
     if (pageCount !== undefined) knownCount = pageCount;
     if (nextLoading !== undefined) loading = nextLoading;
     if (nextLoader !== undefined) loadPage = nextLoader;
-    if (nextGroupLoader !== undefined) groupControls.setLoader(nextGroupLoader);
+    if (nextGroupLoader !== undefined) onLoadGroup = nextGroupLoader;
+    const connectionChanged = nextOffline !== undefined && nextOffline !== offline;
+    if (connectionChanged) {
+      offline = nextOffline;
+      connectionStatus.textContent = offline ? "Sem conexão" : "";
+      if (offline && activePanel === "group") {
+        showPanel(null);
+        counter.focus({ preventScroll: true });
+      }
+    }
+    if (connectionChanged || nextGroupLoader !== undefined) groupControls.setLoader(offline ? undefined : onLoadGroup);
     else if (nextLoading === null) groupControls.refresh();
     if (title !== undefined) displayTitle(title);
     if (nextTheme !== undefined) {
@@ -1263,7 +1286,9 @@ export function renderReader(root, {
       }
     }
     maybeOpenInitialHighlight();
-    if (displayed !== pages[page]) {
+    if (connectionChanged && !offline && retryPage?.offline) {
+      retryPageLoad();
+    } else if (displayed !== pages[page]) {
       void goTo(page, anchor, { persist: false });
     } else if (!displayed) {
       const first = pages.findIndex(Boolean);

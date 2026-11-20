@@ -21,14 +21,18 @@ function highlightKeys(account, id) {
   }
 }
 
+export function pendingPreviewPosition(account, id) {
+  return read(`${prefix(account, id)}posicao`)
+}
+
 export function pendingReading(account, id) {
-  const position = read(`${prefix(account, id)}posicao`)
+  const position = pendingPreviewPosition(account, id)
   const highlights = highlightKeys(account, id).map(read).filter(Boolean)
   return { position, highlights }
 }
 
 export function savePendingPosition(account, id, page, anchor) {
-  localStorage.setItem(`${prefix(account, id)}posicao`, JSON.stringify({ page, anchor }))
+  localStorage.setItem(`${prefix(account, id)}posicao`, JSON.stringify({ page, anchor, readAt: new Date().toISOString() }))
 }
 
 export function addPendingHighlight(account, id, data) {

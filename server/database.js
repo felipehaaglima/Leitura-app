@@ -1,9 +1,17 @@
 import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-const progressColumns = ['current_block', 'current_offset'];
-const missingProgressColumns = (columns) => progressColumns.filter((name) => !columns.some((column) => column.name === name));
-const addProgressColumn = (name) => `ALTER TABLE books ADD COLUMN ${name} INTEGER NOT NULL DEFAULT 0`;
+const progressColumns = {
+  current_block: 'INTEGER NOT NULL DEFAULT 0',
+  current_offset: 'INTEGER NOT NULL DEFAULT 0',
+  read_at: 'TEXT',
+};
+const missingProgressColumns = (columns) => Object.keys(progressColumns).filter((name) => !columns.some((column) => column.name === name));
+function addProgressColumn(name) {
+  const add = `ALTER TABLE books ADD COLUMN ${name} ${progressColumns[name]}`;
+  // Existing books used updated_at as their last progress timestamp.
+  return name === 'read_at' ? `${add}; UPDATE books SET read_at = updated_at` : add;
+}
 
 const schema = `
   CREATE TABLE IF NOT EXISTS users (
@@ -32,7 +40,8 @@ const schema = `
     current_block INTEGER NOT NULL DEFAULT 0,
     current_offset INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    read_at TEXT
   ) TABLE_OPTION;
   CREATE INDEX IF NOT EXISTS books_owner ON books(owner_id, updated_at);
 

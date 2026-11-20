@@ -52,7 +52,7 @@ function prepare(sql) {
 const summaryFields = `
   id, title, thumbnail, page_count AS "pageCount", current_page AS "currentPage",
   current_block AS "currentBlock", current_offset AS "currentOffset",
-  created_at AS "createdAt", updated_at AS "updatedAt",
+  created_at AS "createdAt", updated_at AS "updatedAt", read_at AS "readAt",
   (SELECT from_user_id FROM book_origins WHERE book_id = books.id) AS "referrerId",
   (SELECT users.name FROM book_origins JOIN users ON users.id = book_origins.from_user_id
    WHERE book_origins.book_id = books.id) AS "referrerName",
@@ -66,8 +66,9 @@ const insertBookSql = `
 const bookSummarySql = `SELECT ${summaryFields} FROM books WHERE id = ? AND owner_id = ?`;
 const listBooksSql = `SELECT ${summaryFields} FROM books WHERE owner_id = ? ORDER BY updated_at DESC, id`;
 const updateProgressSql = `
-  UPDATE books SET current_page = ?, current_block = ?, current_offset = ?, updated_at = ?
+  UPDATE books SET current_page = ?, current_block = ?, current_offset = ?, updated_at = ?, read_at = ?
   WHERE id = ? AND owner_id = ? AND page_count > ?
+    AND (? = 1 OR read_at IS NULL OR read_at < ?)
 `;
 const highlightFields = `
   highlights.id, highlights.page, highlights.block, highlights."start", highlights."end",
@@ -128,7 +129,11 @@ const queries = {
     )
     SELECT substr(page_json, ?, ?) AS chunk, length(page_json) AS "dataLength" FROM book_page
   `),
-  getBookPageCount: prepare('SELECT page_count AS "pageCount" FROM books WHERE id = ? AND owner_id = ?'),
+  getBookPosition: prepare(`
+    SELECT page_count AS "pageCount", current_page AS page, current_block AS block,
+      current_offset AS "offset", COALESCE(read_at, updated_at) AS "readAt"
+    FROM books WHERE id = ? AND owner_id = ?
+  `),
   deleteHighlight: prepare(`
     DELETE FROM highlights
     WHERE id = ? AND book_id IN (SELECT id FROM books WHERE id = ? AND owner_id = ?)
@@ -383,16 +388,26 @@ function notFound() {
 }
 
 async function saveProgress(request, response, bookId, userId) {
-  const { page, anchor = { block: 0, offset: 0 } } = await readJson(request);
+  const { page, anchor = { block: 0, offset: 0 }, readAt: inputReadAt } = await readJson(request);
   const { block, offset } = anchor ?? {};
   if (!Number.isSafeInteger(page) || page < 0 || page >= 2_000) throw new HttpError(400, 'Página inválida.');
   if (!Number.isSafeInteger(block) || block < 0 || block >= 1_000
       || !Number.isSafeInteger(offset) || offset < 0 || offset > 250_000) {
     throw new HttpError(400, 'Posição de leitura inválida.');
   }
+  const now = new Date();
+  const hasReadAt = inputReadAt !== undefined;
+  let readAt = now.toISOString();
+  if (hasReadAt) {
+    const parsed = typeof inputReadAt === 'string' ? new Date(inputReadAt) : null;
+    if (!parsed || Number.isNaN(parsed.valueOf()) || parsed.toISOString() !== inputReadAt || inputReadAt.length !== 24) {
+      throw new HttpError(400, 'Data da leitura inválida.');
+    }
+    if (parsed < now) readAt = inputReadAt;
+  }
 
   const update = (connection) => connection.run(
-    updateProgressSql, page, block, offset, new Date().toISOString(), bookId, userId, page,
+    updateProgressSql, page, block, offset, now.toISOString(), readAt, bookId, userId, page, Number(!hasReadAt), readAt,
   );
   // Page-only progress and an anchor at the page start need no PDF content lookup.
   const result = block || offset ? await storage.transaction(async (connection) => {
@@ -407,10 +422,14 @@ async function saveProgress(request, response, bookId, userId) {
     return update(connection);
   }) : await update(storage);
   if (result.changes === 0) {
-    if (!await queries.getBookPageCount.get(bookId, userId)) throw notFound();
-    throw new HttpError(400, 'Página inválida.');
+    const saved = await queries.getBookPosition.get(bookId, userId);
+    if (!saved) throw notFound();
+    if (page >= saved.pageCount) throw new HttpError(400, 'Página inválida.');
+    return respondJson(response, 200, {
+      ok: true, applied: false, page: saved.page, anchor: { block: saved.block, offset: saved.offset }, readAt: saved.readAt,
+    });
   }
-  respondJson(response, 200, { ok: true });
+  respondJson(response, 200, hasReadAt ? { ok: true, applied: true, page, anchor: { block, offset }, readAt } : { ok: true });
 }
 
 function splitsSurrogate(text, offset) {
@@ -729,6 +748,7 @@ async function listRows(sql, id, searchParams, limit, hosted) {
 
 async function handleApi(request, response, pathname, searchParams, hosted) {
   const { method } = request;
+  const expectedAccount = request.headers['x-margem-account'];
   if (method !== 'GET') enforceSameOrigin(request);
   if (pathname === '/api/session' && method === 'GET') {
     return respondJson(response, 200, { user: await activeUser(request) });
@@ -736,6 +756,9 @@ async function handleApi(request, response, pathname, searchParams, hosted) {
   if (pathname === '/api/register' && method === 'POST') return register(request, response, hosted);
   if (pathname === '/api/login' && method === 'POST') return login(request, response, hosted);
   if (pathname === '/api/logout' && method === 'POST') {
+    if (expectedAccount !== undefined && (await activeUser(request))?.id !== expectedAccount) {
+      throw new HttpError(401, 'Entre novamente na conta que deseja desconectar.');
+    }
     const hash = sessionHash(request);
     if (hash) await queries.deleteSession.run(hash);
     sessionHeader(response, '', 0, hosted);
@@ -744,6 +767,9 @@ async function handleApi(request, response, pathname, searchParams, hosted) {
 
   const user = await activeUser(request);
   if (!user) throw new HttpError(401, 'Entre na sua conta para continuar.');
+  if (expectedAccount !== undefined && expectedAccount !== user.id) {
+    throw new HttpError(401, 'Entre novamente na conta que salvou esta leitura.');
+  }
 
   if (pathname.startsWith('/api/social') && await social.handle(request, response, pathname, searchParams, user)) return;
   if (await notes.handle(request, response, pathname, searchParams, user)) return;

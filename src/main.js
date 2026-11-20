@@ -1,7 +1,17 @@
 import './style.css'
+import './pwa.js'
+import { createCachedReading } from './cached-reading.js'
 import { createImportManager } from './import-jobs.js'
 import {
-  addPendingHighlight, clearPendingReading, pendingReading, removePendingHighlight,
+  listOfflineBooks, readOfflineAccount, readOfflineBook, readOfflineNotes, removeOfflineBook,
+  saveOfflineAccount, saveOfflineBook, saveOfflineNotes, setOfflineAccount,
+} from './offline-library.js'
+import {
+  applyPendingHighlights, applyPendingNotes, clearSavedReadingChanges, pendingReadingBooks,
+  pendingSavedPosition, saveReadingChange, syncReadingChanges,
+} from './offline-outbox.js'
+import {
+  addPendingHighlight, clearPendingReading, pendingPreviewPosition, pendingReading, removePendingHighlight,
   savePendingPosition, syncPendingReading, updatePendingHighlight,
 } from './pending-reading.js'
 import { normalizeReaderTheme } from './reader-themes.js'
@@ -38,6 +48,13 @@ let user = null
 let books = []
 let booksVersion = 0
 let highlightPalette = []
+let offline = !navigator.onLine
+let offlineBooks = new Map()
+let sessionRevision = 0
+let connecting
+let reconnectTimer
+let readingSync
+let syncTimer
 let themePreference = { account: null, theme: guestReaderTheme(), revision: 0, writeQueue: Promise.resolve() }
 let section = 'library'
 let filter = 'all'
@@ -62,12 +79,15 @@ function announce(message) {
   toastTimeout = window.setTimeout(() => { toast.hidden = true }, 4200)
 }
 
-async function api(path, { method = 'GET', data, signal } = {}) {
+async function api(path, { method = 'GET', data, signal, account } = {}) {
+  if (account && user?.id !== account) {
+    throw Object.assign(new Error('Entre na sua conta para continuar.'), { status: 401 })
+  }
+  const headers = new Headers()
+  if (data !== undefined) headers.set('Content-Type', 'application/json')
+  if (account) headers.set('X-Margem-Account', account)
   const response = await fetch(`/api${path}`, {
-    method,
-    signal,
-    headers: data === undefined ? {} : { 'Content-Type': 'application/json' },
-    body: data === undefined ? undefined : JSON.stringify(data),
+    method, signal, headers, body: data === undefined ? undefined : JSON.stringify(data),
   })
   const body = await response.json().catch(() => null)
   if (!response.ok || !body) {
@@ -130,18 +150,25 @@ async function uploadBook(document, onProgress, { id, accountId, signal }) {
   return (await api(`${path}/complete`, { method: 'POST', signal })).book
 }
 
-async function readRequest(path, signal) {
+function isConnectionFailure(error) {
+  return error instanceof TypeError || error?.code === 'CONNECTION' || error?.name === 'TimeoutError' ||
+    [502, 503, 504].includes(error?.status)
+}
+
+async function readRequest(path, signal, account) {
   signal?.throwIfAborted()
   const controller = new AbortController()
   const cancel = () => controller.abort(signal.reason)
   signal?.addEventListener('abort', cancel, { once: true })
   const timer = setTimeout(() => controller.abort(), 20_000)
   try {
-    return await api(path, { signal: controller.signal })
+    return await api(path, { signal: controller.signal, account })
   } catch (error) {
     signal?.throwIfAborted()
-    if (controller.signal.aborted) throw new Error('A resposta demorou demais. Tente novamente.')
-    if (error instanceof TypeError) throw new Error('A conexão falhou. Tente novamente.')
+    if (controller.signal.aborted || error instanceof TypeError) {
+      const message = controller.signal.aborted ? 'A resposta demorou demais.' : 'A conexão falhou.'
+      throw Object.assign(new Error(message), { code: 'CONNECTION', cause: error })
+    }
     throw error
   } finally {
     clearTimeout(timer)
@@ -149,15 +176,15 @@ async function readRequest(path, signal) {
   }
 }
 
-function savedPageLoader(id) {
+function savedPageLoader(id, account) {
   return async (page, signal) => {
     const path = `/books/${id}/page?page=${page}`
-    const { chunk, partCount } = await readRequest(path, signal)
+    const { chunk, partCount } = await readRequest(path, signal, account)
     if (typeof chunk !== 'string' || !Number.isSafeInteger(partCount) || partCount < 1) {
       throw new Error('Não foi possível ler o conteúdo desta página.')
     }
     const remaining = await transferParts(partCount - 1, async index => (
-      (await readRequest(`${path}&part=${index + 1}`, signal)).chunk
+      (await readRequest(`${path}&part=${index + 1}`, signal, account)).chunk
     ))
     let content
     try {
@@ -200,6 +227,7 @@ function bookCard(book) {
       <h3>${escape(book.title)}</h3>
       <p>${book.recommendedBy?.name ? `Indicado por ${escape(book.recommendedBy.name)}` : escape(book.author ?? 'PDF importado')}</p>
       <span class="book-genre">${escape(book.genre ?? `${book.pageCount} páginas`)}</span>
+      ${imported && offlineBooks.has(book.id) ? '<small class="book-offline">Páginas salvas offline</small>' : ''}
     </div>
     ${book.currentPage > 0 ? `<span class="book-progress" aria-label="Página ${book.currentPage + 1} de ${book.pageCount}"><span style="width: ${(book.currentPage + 1) / book.pageCount * 100}%"></span></span>` : ''}
   </button>
@@ -258,10 +286,14 @@ async function renderHighlights() {
     const examples = sampleBooks.map(book => ({ ...book, highlights: sampleState(book).highlights }))
     const imported = new Map()
     if (user) {
-      for (const book of await listAll('/highlights', 'books')) {
+      const account = user.id
+      const sources = offline ? (await Promise.all([...offlineBooks.keys()].map(id => readOfflineBook(account, id)))).filter(Boolean)
+        : await listAll('/highlights', 'books', 0, path => readRequest(path, undefined, account))
+      for (const book of sources) {
         if (!imported.has(book.id)) imported.set(book.id, { ...book, highlights: [] })
-        imported.get(book.id).highlights.push(...book.highlights)
+        imported.get(book.id).highlights.push(...(book.highlights ?? []))
       }
+      for (const book of imported.values()) book.highlights = applyPendingHighlights(account, book.id, book.highlights)
     }
     if (!results.isConnected) return
     const markedBooks = [...imported.values(), ...examples].filter(book => book.highlights.length)
@@ -284,6 +316,7 @@ function renderShell() {
   socialCleanup?.()
   socialCleanup = undefined
   readerCleanup?.()
+  readerSession?.cache?.cleanup()
   readerCleanup = undefined
   readerBook = undefined
   readerSession = undefined
@@ -315,6 +348,7 @@ function renderShell() {
     <main class="main-area">
       <header class="topbar"><p>${icon(sectionIcon)} ${sectionName}</p>
         <button class="button topbar-upload" type="button" data-action="upload">${icon('upload')} Importar PDF</button></header>
+      <p class="offline-notice" role="status" ${offline ? '' : 'hidden'}>Sem conexão. Leia os livros com páginas salvas neste dispositivo.</p>
       <div id="import-summary" class="import-summary" hidden>
         <div class="import-summary-actions">
           <button type="button" class="import-summary-button" data-action="upload" aria-haspopup="dialog">
@@ -338,6 +372,10 @@ function renderShell() {
 
 async function mountSocial() {
   const target = document.querySelector('#social-view')
+  if (offline) {
+    target.innerHTML = '<div class="page-content"><div class="page-intro"><h1>Social</h1><p>Conecte-se para acessar suas amizades e leituras em grupo.</p></div></div>'
+    return
+  }
   try {
     const { renderSocial } = await import('./social-view.js')
     if (target.isConnected) {
@@ -361,6 +399,7 @@ function showDialog(title, contents, view = '') {
 }
 
 function showAuth(mode = 'login', after) {
+  if (offline || !navigator.onLine) return announce('Conecte-se para entrar na sua conta.')
   const register = mode === 'register'
   showDialog(register ? 'Crie sua conta' : 'Entre na Margem', `
     <p class="modal-description">Acesse sua biblioteca, seus destaques e seu progresso de leitura.</p>
@@ -385,13 +424,16 @@ function showAuth(mode = 'login', after) {
     error.hidden = true
     try {
       const data = Object.fromEntries(new FormData(form))
-      user = (await api(register ? '/register' : '/login', { method: 'POST', data })).user
-      void refreshPalette(user.id)
-      setThemeAccount(user.id)
+      const next = (await api(register ? '/register' : '/login', { method: 'POST', data })).user
+      sessionRevision++
+      await useSession(next, await readOfflineAccount(), { verified: true })
+      void refreshPalette(next.id)
+      void refreshReaderTheme(themePreference)
       try { await refreshBooks() } catch (failure) { announce(failure.message) }
       await setupImports()
       dialog.close()
       renderShell()
+      scheduleReadingSync(0)
       after?.()
     } catch (failure) {
       error.hidden = false
@@ -438,6 +480,8 @@ function updateImportProgress(job) {
   if (readerSession?.preview && readerBook?.id === job.id) {
     const preview = imports.getPreview(job.id)
     if (preview) {
+      readerSession.pages = preview.pages
+      readerSession.pageCount = preview.pageCount
       readerBook = { ...readerBook, ...preview }
       readerCleanup?.updateBook(preview)
     }
@@ -475,8 +519,9 @@ function showImportProgress() {
 }
 
 function showUpload() {
-  if (!user) return showAuth('login', showUpload)
   if (imports.current) return showImportProgress()
+  if (offline || !navigator.onLine) return announce('Conecte-se para importar um PDF.')
+  if (!user) return showAuth('login', showUpload)
   showDialog('Importar PDF', `
     <p class="modal-description">O texto será extraído para o leitor. Para páginas escaneadas ou com caracteres ilegíveis, o app tenta reconhecer o texto em português e inglês.</p>
     <form id="upload-form" class="modal-form">
@@ -517,27 +562,186 @@ async function setupImports() {
   }
 }
 
+async function refreshOfflineBooks(account) {
+  const entries = await listOfflineBooks(account)
+  if (user?.id !== account) return
+  const next = new Map(entries.map(book => [book.id, book.cachedPages]))
+  const changed = next.size !== offlineBooks.size || [...next].some(([id]) => !offlineBooks.has(id))
+  offlineBooks = next
+  if (changed) renderBookList()
+}
+
+function setOffline(value) {
+  if (offline === value) return
+  offline = value
+  const notice = document.querySelector('.offline-notice')
+  if (notice) notice.hidden = !offline
+  readerCleanup?.updateBook({ offline })
+  if (!readerBook && section === 'social') {
+    socialCleanup?.()
+    socialCleanup = undefined
+    void mountSocial()
+  }
+  if (!readerBook && section === 'highlights') void renderHighlights()
+  if (offline) retryConnection()
+}
+
+function retryConnection() {
+  clearTimeout(reconnectTimer)
+  if (navigator.onLine && document.visibilityState !== 'hidden') {
+    reconnectTimer = setTimeout(() => void reconnect(), 15_000)
+  }
+}
+
+async function useSession(next, cached, { verified = false, revision = sessionRevision } = {}) {
+  if (revision !== sessionRevision) return
+  if (verified) await setOfflineAccount(next)
+  if (revision !== sessionRevision) return
+  const switched = user?.id !== next?.id
+  user = next
+  if (!switched) return
+  const snapshot = next && cached?.user?.id === next.id ? cached : null
+  setBooks(snapshot ? withPendingProgress(next.id, snapshot.books) : [], { cache: false })
+  offlineBooks = new Map((snapshot?.offlineBooks ?? []).map(book => [book.id, book.cachedPages]))
+  highlightPalette = snapshot?.palette ?? []
+  if (readerBook || openingBook) {
+    readerRequest++
+    openingBook?.abort()
+    renderShell()
+  }
+  setThemeAccount(next?.id ?? null, snapshot?.theme)
+}
+
+function accountReadingApi(account) {
+  return (path, options = {}) => api(path, { ...options, account, signal: options.signal ?? AbortSignal.timeout?.(15_000) })
+}
+
+function scheduleReadingSync(delay = 350) {
+  clearTimeout(syncTimer)
+  if (!offline && navigator.onLine && user) syncTimer = setTimeout(() => void syncAccountReading(user.id), delay)
+}
+
+async function syncAccountReading(account) {
+  if (readingSync?.account === account) return readingSync.task
+  const task = (async () => {
+    const request = accountReadingApi(account)
+    const ids = pendingReadingBooks(account)
+    const progress = new Map()
+    let pending = false
+    let failure
+    for (const id of ids) {
+      if (user?.id !== account || offline || !navigator.onLine) return
+      try {
+        await syncPendingReading(request, account, id)
+        const result = await syncReadingChanges(request, account, id)
+        pending ||= result.pending
+        failure ||= result.failures[0]
+        const saved = result.positionOutcome?.value
+        if (Number.isInteger(saved?.page) && !pendingSavedPosition(account, id)) {
+          progress.set(id, { currentPage: saved.page, anchor: saved.anchor, readAt: saved.readAt })
+        }
+      } catch (error) {
+        if (isConnectionFailure(error)) {
+          setOffline(true)
+          return
+        }
+        pending = true
+      }
+    }
+    if (user?.id !== account) return
+    if (progress.size) {
+      for (const [id, data] of progress) {
+        if (pendingSavedPosition(account, id)) continue
+        void saveOfflineBook(account, id, data)
+      }
+      setBooks(withPendingProgress(account, books.map(book => progress.has(book.id) ? { ...book, ...progress.get(book.id) } : book)))
+      renderBookList()
+    }
+    if (failure) announce(failure.message ?? 'Algumas alterações não puderam ser sincronizadas.')
+    if (ids.length && !pending) await refreshVisibleLibrary()
+    if (pending || pendingReadingBooks(account).length) retryConnection()
+  })().catch(error => {
+    if (isConnectionFailure(error)) setOffline(true)
+    else announce(error.message)
+  }).finally(() => {
+    if (readingSync?.task === task) readingSync = undefined
+  })
+  readingSync = { account, task }
+  return task
+}
+
+function reconnect({ initial = false } = {}) {
+  if (connecting) return connecting
+  const revision = sessionRevision
+  const task = (async () => {
+    const cached = await readOfflineAccount()
+    let verified = false
+    try {
+      if (!navigator.onLine) throw Object.assign(new Error('Sem conexão.'), { code: 'CONNECTION' })
+      const { user: next } = await readRequest('/session')
+      if (revision !== sessionRevision) return
+      verified = true
+      const changed = user?.id !== next?.id
+      await useSession(next, cached, { verified: true, revision })
+      if (revision !== sessionRevision) return
+      setOffline(false)
+      if (next) {
+        await syncAccountReading(next.id)
+        if (!offline) {
+          void refreshPalette(next.id)
+          void refreshReaderTheme(themePreference)
+          await refreshBooks()
+          readerSession?.warm?.(true)
+        }
+      }
+      if (initial || changed) await setupImports()
+      if (!readerBook && (initial || changed)) renderShell()
+      else if (!readerBook && section === 'library') renderBookList()
+    } catch (error) {
+      if (revision !== sessionRevision) return
+      if (!isConnectionFailure(error)) return announce(error.message)
+      setOffline(true)
+      if (initial && !verified) {
+        await useSession(cached?.user ?? null, cached, { revision })
+        await setupImports()
+      }
+      if (initial && !readerBook) renderShell()
+      retryConnection()
+    }
+  })().finally(() => {
+    if (connecting === task) connecting = undefined
+  })
+  connecting = task
+  return task
+}
+
 function finishUpload({ id, book, fallbackPages }, accountId) {
   if (user?.id !== accountId) return
   const completedId = id ?? book?.id
   const liveReader = readerBook?.id === completedId && readerSession?.preview ? readerSession : null
   if (liveReader) liveReader.preview = false
   const draft = pendingReading(accountId, completedId)
-  const sync = syncPendingReading(api, accountId, completedId).catch(error => announce(error.message))
+  const sync = syncPendingReading(accountReadingApi(accountId), accountId, completedId).catch(error => announce(error.message))
   if (book) {
     setBooks([book, ...books.filter(item => item.id !== book.id)])
     renderBookList()
   }
   if (liveReader && readerSession === liveReader) {
     const item = book ?? books.find(item => item.id === completedId)
+    liveReader.cache = cachedBook(accountId, completedId)
     const patch = {
-      loadPage: savedPageLoader(completedId),
+      loadPage: liveReader.cache.loadPage,
       pageCount: item?.pageCount ?? readerBook.pageCount,
       title: item?.title ?? readerBook.title,
       loading: null,
     }
+    liveReader.pageCount = patch.pageCount
     readerBook = { ...readerBook, ...patch }
     readerCleanup?.updateBook(patch)
+    void saveOfflineBook(accountId, completedId, {
+      ...item, title: readerBook.title, pageCount: liveReader.pageCount,
+      currentPage: liveReader.page, anchor: draft.position?.anchor, highlights: [...liveReader.highlights.values()],
+    }).then(() => liveReader.warm())
   }
   if (!book || draft.position || draft.highlights.length) {
     const ready = book ? sync : Promise.resolve()
@@ -566,6 +770,7 @@ function finishUpload({ id, book, fallbackPages }, accountId) {
 function showDeleteBook(id) {
   const book = books.find(item => item.id === id)
   if (!user || !book) return
+  if (offline || !navigator.onLine) return announce('Conecte-se para apagar um livro da biblioteca.')
   const account = user.id
   readerRequest++
   showDialog('Apagar livro?', `
@@ -585,11 +790,14 @@ function showDeleteBook(id) {
     submit.disabled = true
     error.hidden = true
     try {
-      await api(`/books/${id}`, { method: 'DELETE' }).catch(failure => {
+      await api(`/books/${id}`, { method: 'DELETE', account }).catch(failure => {
         if (failure.status !== 404) throw failure
       })
       setBooks(books.filter(item => item.id !== id))
       clearPendingReading(account, id)
+      clearSavedReadingChanges(account, id)
+      await removeOfflineBook(account, id)
+      offlineBooks.delete(id)
       if (dialog.open && dialog.contains(form)) dialog.close()
       renderBookList()
       announce('Livro apagado da biblioteca.')
@@ -606,16 +814,33 @@ function showDeleteBook(id) {
   }
 }
 
-function setBooks(result) {
+function setBooks(result, { cache = true } = {}) {
   booksVersion++
   books = result
+  if (cache && user) void saveOfflineAccount(user.id, { books })
+}
+
+function withPendingProgress(account, entries) {
+  return entries.map(book => {
+    const pending = pendingSavedPosition(account, book.id) ?? pendingPreviewPosition(account, book.id)
+    return pending ? { ...book, currentPage: pending.page, anchor: pending.anchor, readAt: pending.readAt } : book
+  })
 }
 
 async function refreshBooks() {
   const account = user?.id
+  if (offline || !account) return
   const version = ++booksVersion
-  const result = account ? await listAll('/books', 'books') : []
-  if (account === user?.id && version === booksVersion) books = result
+  const result = await listAll('/books', 'books', 0, path => readRequest(path, undefined, account))
+  if (account !== user?.id || version !== booksVersion) return
+  setBooks(withPendingProgress(account, result))
+  for (const book of books) {
+    if (offlineBooks.has(book.id)) {
+      const { currentPage, anchor, readAt } = book
+      void saveOfflineBook(account, book.id, { currentPage, anchor, readAt })
+    }
+  }
+  void refreshOfflineBooks(account)
 }
 
 async function refreshVisibleLibrary() {
@@ -624,15 +849,17 @@ async function refreshVisibleLibrary() {
     await refreshBooks()
     renderBookList()
   } catch (error) {
-    if (section === 'library' && !readerBook) announce(error.message)
+    if (isConnectionFailure(error)) setOffline(true)
+    else if (section === 'library' && !readerBook) announce(error.message)
   }
 }
 
 async function refreshPalette(account) {
   try {
-    const { colors } = await api('/reader/colors')
+    const { colors } = await readRequest('/reader/colors', undefined, account)
     if (user?.id === account) {
       highlightPalette = [...new Set([...colors, ...highlightPalette])]
+      void saveOfflineAccount(account, { palette: highlightPalette })
       readerCleanup?.updateBook({ palette: highlightPalette })
     }
   } catch {
@@ -648,19 +875,19 @@ function guestReaderTheme() {
   }
 }
 
-function setThemeAccount(account) {
-  const preference = { account, theme: account ? 'classic' : guestReaderTheme(), revision: 0, writeQueue: Promise.resolve() }
+function setThemeAccount(account, cachedTheme) {
+  const preference = { account, theme: account ? normalizeReaderTheme(cachedTheme) : guestReaderTheme(), revision: 0, writeQueue: Promise.resolve() }
   themePreference = preference
   readerCleanup?.updateBook({ theme: preference.theme })
-  if (account) void refreshReaderTheme(preference)
 }
 
 async function refreshReaderTheme(preference) {
   const revision = preference.revision
   try {
-    const { theme } = await readRequest('/reader/theme')
+    const { theme } = await readRequest('/reader/theme', undefined, preference.account)
     if (themePreference !== preference || revision !== preference.revision) return
     preference.theme = normalizeReaderTheme(theme)
+    void saveOfflineAccount(preference.account, { theme: preference.theme })
     readerCleanup?.updateBook({ theme: preference.theme })
   } catch {
     // The reader stays usable with its current theme if the preference cannot be loaded.
@@ -672,8 +899,10 @@ function saveReaderTheme(preference, theme, session) {
     if (themePreference !== preference) throw new Error('Abra o leitor novamente para alterar o tema.')
     let savedTheme = normalizeReaderTheme(theme)
     if (preference.account) {
-      const saved = await api('/reader/theme', { method: 'PUT', data: { theme: savedTheme } })
+      if (offline) throw new Error('Conecte-se para alterar o tema da sua conta.')
+      const saved = await api('/reader/theme', { method: 'PUT', data: { theme: savedTheme }, account: preference.account })
       savedTheme = normalizeReaderTheme(saved.theme)
+      void saveOfflineAccount(preference.account, { theme: savedTheme })
     } else {
       try {
         localStorage.setItem(guestThemeKey, savedTheme)
@@ -730,12 +959,12 @@ function openCurrentRoute() {
   else showAuth('login', () => { if (routedBook() === id) void openBook(id) })
 }
 
-async function loadReadingGroup(id, page, signal) {
+async function loadReadingGroup(account, id, page, signal) {
   const path = `/social/books/${id}/group?page=${page}`
-  const group = await readRequest(path, signal)
+  const group = await readRequest(path, signal, account)
   let offset = group.nextOffset
   while (offset != null) {
-    const batch = await readRequest(`${path}&offset=${offset}`, signal)
+    const batch = await readRequest(`${path}&offset=${offset}`, signal, account)
     if (batch.status !== 'active') return batch
     group.highlights.push(...batch.highlights)
     offset = batch.nextOffset
@@ -750,14 +979,16 @@ function readAvailablePages() {
   void openBook(job.id)
 }
 
-async function loadSavedReading(id, requestedPage, signal) {
-  const { book } = await readRequest(`/books/${id}?metadata=1&paged=1`, signal)
-  const position = requestedPage ?? book.currentPage ?? 0
-  const initialPage = Number.isInteger(position) && position >= 0 && position < book.pageCount ? position : 0
-  const pages = new Array(book.pageCount)
-  const loadPage = savedPageLoader(id)
-  pages[initialPage] = await loadPage(initialPage, signal)
-  return { ...book, pages, loadPage, initialPage }
+function cachedBook(account, id) {
+  return createCachedReading({
+    id, account,
+    readBook: async signal => (await readRequest(`/books/${id}?metadata=1&paged=1`, signal, account)).book,
+    readPage: savedPageLoader(id, account),
+    isOffline: () => offline || !navigator.onLine,
+    isConnectionFailure,
+    onConnectionFailure: () => { if (user?.id === account) setOffline(true) },
+    onCacheChange: () => void refreshOfflineBooks(account),
+  })
 }
 
 function showOpeningBook(title) {
@@ -775,7 +1006,10 @@ function showOpenFailure(error, retry, reload) {
       <button class="button secondary" type="button" data-action="close-dialog">Fechar</button>
       <button class="button primary" type="button" id="retry-open-book">${reload ? 'Atualizar página' : 'Tentar novamente'}</button>
     </div>`, 'open-book-error')
-  dialog.querySelector('#retry-open-book').onclick = reload ? () => window.location.reload() : retry
+  dialog.querySelector('#retry-open-book').onclick = reload ? () => window.location.reload() : async () => {
+    if (error.code === 'OFFLINE_PAGE' && offline && navigator.onLine) await reconnect()
+    retry()
+  }
 }
 
 async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
@@ -790,14 +1024,18 @@ async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
   openingBook = controller
   const { signal } = controller
   const pending = sample ? null : pendingReading(account, id)
-  const requestedPage = explicitPage ?? pending?.position?.page
+  const queuedPosition = sample ? null : pendingSavedPosition(account, id) ?? pending.position
+  const requestedPage = explicitPage ?? queuedPosition?.page
   const title = sample?.title ?? saved?.title ?? preview?.title ?? 'Carregando a página de leitura…'
   if (!sample && !preview) showOpeningBook(title)
   let moduleFailed = false
+  let cache = !sample && !preview ? cachedBook(account, id) : null
+  let mounted = false
+  const openSaved = () => cache.open(requestedPage, signal, { explicit: explicitPage !== undefined })
   const active = () => request === readerRequest && user?.id === account && !signal.aborted
   try {
     const [initial, reader] = await Promise.all([
-      sample ?? preview ?? loadSavedReading(id, requestedPage, signal),
+      sample ?? preview ?? openSaved(),
       import('./reader.js').catch(() => {
         moduleFailed = true
         throw new Error('Atualize a página para carregar o leitor.')
@@ -807,25 +1045,35 @@ async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
     let book = preview ? imports.getPreview(id) : initial
     if (!book) {
       showOpeningBook(title)
-      book = await loadSavedReading(id, requestedPage, signal)
+      cache = cachedBook(account, id)
+      book = await openSaved()
     }
     if (!active()) return
     const sampleProgress = sample ? sampleState(sample, account) : null
     const position = book.initialPage ?? explicitPage ?? (sample ? sampleProgress.position : pending.position?.page ?? 0)
-    const anchor = explicitAnchor ?? (explicitPage === undefined
-      ? (sample ? sampleProgress.anchor : pending.position?.anchor ?? book.anchor)
+    const anchor = explicitAnchor ?? (explicitPage === undefined && !book.offlineFallback
+      ? (sample ? sampleProgress.anchor : queuedPosition?.anchor ?? book.anchor)
       : null)
     const marks = sample ? sampleProgress.highlights : (book.highlights ?? [])
     const highlights = pending
-      ? [...marks, ...pending.highlights.filter(mark => !marks.some(item => item.id === mark.id))]
+      ? applyPendingHighlights(account, id, [...marks, ...pending.highlights.filter(mark => !marks.some(item => item.id === mark.id))])
       : marks
-    const session = { preview: Boolean(book.loading) }
+    const session = {
+      preview: Boolean(book.loading), cache, page: position, pages: book.pages, pageCount: book.pageCount,
+      highlights: new Map(highlights.map(mark => [mark.id, mark])),
+      warm(force = false) { session.cache?.warm(session.page, session.pageCount, session.pages[session.page], { force }) },
+    }
+    const requestAccount = accountReadingApi(account)
     const notesPath = markId => `/books/${id}/highlights/${markId}/notes`
     const localMark = markId => sample
       ? sampleProgress.highlights.find(mark => mark.id === markId)
       : pendingReading(account, id).highlights.find(mark => mark.id === markId)
     const saveLocalMark = (markId, changes) => {
-      if (!sample) return updatePendingHighlight(account, id, markId, changes)
+      if (!sample) {
+        const highlight = updatePendingHighlight(account, id, markId, changes)
+        session.highlights.set(markId, highlight)
+        return highlight
+      }
       const index = sampleProgress.highlights.findIndex(mark => mark.id === markId)
       if (index < 0) throw new Error('Destaque não encontrado.')
       const highlight = { ...sampleProgress.highlights[index], ...changes }
@@ -833,15 +1081,63 @@ async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
       storeSample(sample, sampleProgress, account)
       return highlight
     }
+    async function writeReading(change, { background = false } = {}) {
+      if (user?.id !== account) throw new Error('Entre na sua conta para salvar a leitura.')
+      if (!offline && !background) await syncPendingReading(requestAccount, account, id).catch(() => {})
+      const outcome = await saveReadingChange(requestAccount, account, id, change, {
+        online: !offline && navigator.onLine, defer: background,
+      })
+      if (!outcome.synced) scheduleReadingSync()
+      return outcome.value
+    }
+    function rememberMarks() {
+      return saveOfflineBook(account, id, { highlights: [...session.highlights.values()] })
+    }
+    async function readNotes(markId, signal) {
+      const mark = session.highlights.get(markId)
+      if (!offline && navigator.onLine) {
+        try {
+          if (localMark(markId)) await syncPendingReading(requestAccount, account, id).catch(() => {})
+          const { notes } = await readRequest(notesPath(markId), signal, account)
+          if (mark) await saveOfflineNotes(account, id, markId, notes)
+          return mark ? applyPendingNotes(account, id, markId, notes) : notes
+        } catch (error) {
+          if (signal?.aborted || !isConnectionFailure(error)) throw error
+          setOffline(true)
+        }
+      }
+      if (!mark) throw new Error('Conecte-se para ver as notas do grupo.')
+      const cachedNotes = await readOfflineNotes(account, id, markId)
+      signal?.throwIfAborted()
+      return applyPendingNotes(account, id, markId, cachedNotes ?? localHighlightNotes(mark))
+    }
     const saveNote = async (markId, noteId, data) => {
       if (sample || session.preview) {
         const result = writeLocalNote(localMark(markId), noteId, data)
         saveLocalMark(markId, result.changes)
         return result.note
       }
-      await syncPendingReading(api, account, id).catch(() => {})
-      const path = notesPath(markId)
-      return (await api(noteId ? `${path}/${noteId}` : path, { method: noteId ? 'PATCH' : 'POST', data })).note
+      let notes = await readOfflineNotes(account, id, markId) ?? localHighlightNotes(session.highlights.get(markId))
+      if (noteId && !offline && !applyPendingNotes(account, id, markId, notes).some(note => note.id === noteId)) {
+        notes = await readNotes(markId)
+      }
+      const current = applyPendingNotes(account, id, markId, notes)
+      if (data.scope === 'group' || current.find(note => note.id === noteId)?.scope === 'group') {
+        if (offline || !navigator.onLine) throw new Error('Conecte-se para alterar notas do grupo.')
+        await syncPendingReading(requestAccount, account, id)
+        await syncReadingChanges(requestAccount, account, id)
+        const path = notesPath(markId)
+        const { note } = await requestAccount(noteId ? `${path}/${noteId}` : path, { method: noteId ? 'PATCH' : 'POST', data })
+        await saveOfflineNotes(account, id, markId, [...current.filter(item => item.id !== note.id), note])
+        return note
+      }
+      const { note } = writeLocalNote({ note: '', notes: current }, noteId, data)
+      const value = await writeReading({
+        kind: noteId ? 'update-note' : 'add-note', markId, noteId,
+        data: { ...data, ...(!noteId && { id: note.id }) }, value: note,
+      })
+      await saveOfflineNotes(account, id, markId, [...current.filter(item => item.id !== note.id), value])
+      return value
     }
     const savePosition = async (page, nextAnchor = { block: 0, offset: 0 }) => {
       if (sample) {
@@ -851,17 +1147,22 @@ async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
         return
       }
       if (user?.id !== account) return
+      session.page = page
       if (session.preview) {
         savePendingPosition(account, id, page, nextAnchor)
         return
       }
-      await syncPendingReading(api, account, id).catch(() => {})
-      await api(`/books/${id}/progress`, { method: 'PATCH', data: { page, anchor: nextAnchor } })
-      setBooks(books.map(item => item.id === id ? { ...item, currentPage: page, anchor: nextAnchor } : item))
+      const data = { page, anchor: nextAnchor, readAt: new Date().toISOString() }
+      await writeReading({ kind: 'position', data, value: data }, { background: true })
+      const progress = { currentPage: page, anchor: nextAnchor, readAt: data.readAt }
+      setBooks(books.map(item => item.id === id ? { ...item, ...progress } : item), { cache: false })
+      void saveOfflineBook(account, id, progress)
+      session.warm()
       if (!readerBook) renderBookList()
     }
 
     readerCleanup?.()
+    readerSession?.cache?.cleanup()
     socialCleanup?.()
     socialCleanup = undefined
     readerSession = session
@@ -869,6 +1170,8 @@ async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
     document.title = `${book.title} — Margem`
     readerCleanup = reader.renderReader(app, {
       book: readerBook,
+      offline,
+      onRetryConnection: () => { if (navigator.onLine) void reconnect() },
       loadPage: book.loadPage,
       initialHighlightId,
       onExit: exitReader,
@@ -877,17 +1180,21 @@ async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
       onChangeTheme: theme => saveReaderTheme(themePreference, theme, session),
       viewerId: account,
       onAddColor: account ? async color => {
-        const { colors } = await api('/reader/colors', { method: 'POST', data: { color } })
-        if (user?.id === account) highlightPalette = [...new Set([...colors, ...highlightPalette])]
+        if (offline) throw new Error('Conecte-se para adicionar uma cor à sua paleta.')
+        const { colors } = await requestAccount('/reader/colors', { method: 'POST', data: { color } })
+        if (user?.id === account) {
+          highlightPalette = [...new Set([...colors, ...highlightPalette])]
+          void saveOfflineAccount(account, { palette: highlightPalette })
+        }
         return colors
       } : undefined,
       onLoadGroup: !sample && account ? (page, groupSignal) => (
-        session.preview || user?.id !== account
+        session.preview || offline || user?.id !== account
           ? Promise.resolve({ status: 'unavailable', members: [], highlights: [] })
-          : loadReadingGroup(id, page, groupSignal)
+          : loadReadingGroup(account, id, page, groupSignal)
       ) : undefined,
-      onStartGroup: !sample && account ? () => api(`/social/books/${id}/group`, { method: 'POST', data: {} }) : undefined,
-      onRespondGroup: !sample && account ? (groupId, accept) => api(`/social/groups/${groupId}`, { method: 'PATCH', data: { accept } }) : undefined,
+      onStartGroup: !sample && account ? () => requestAccount(`/social/books/${id}/group`, { method: 'POST', data: {} }) : undefined,
+      onRespondGroup: !sample && account ? (groupId, accept) => requestAccount(`/social/groups/${groupId}`, { method: 'PATCH', data: { accept } }) : undefined,
       onPosition: savePosition,
       onAddHighlight: async data => {
         if (sample) {
@@ -896,21 +1203,31 @@ async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
           storeSample(sample, sampleProgress, account)
           return highlight
         }
-        if (session.preview) return addPendingHighlight(account, id, data)
-        const { highlight } = await api(`/books/${id}/highlights`, { method: 'POST', data })
+        if (session.preview) {
+          const highlight = addPendingHighlight(account, id, data)
+          session.highlights.set(highlight.id, highlight)
+          return highlight
+        }
+        const mark = { ...data, id: crypto.randomUUID(), createdAt: new Date().toISOString() }
+        const highlight = await writeReading({ kind: 'add-highlight', data: { ...data, id: mark.id }, value: mark })
+        session.highlights.set(highlight.id, highlight)
+        await rememberMarks()
         setBooks(books.map(item => item.id === id ? { ...item, highlightCount: (item.highlightCount ?? 0) + 1 } : item))
         return highlight
       },
       onUpdateHighlight: async (highlightId, changes) => {
         if (sample || session.preview) return saveLocalMark(highlightId, changes)
-        await syncPendingReading(api, account, id).catch(() => {})
-        const { highlight } = await api(`/books/${id}/highlights/${highlightId}`, { method: 'PATCH', data: changes })
+        if (offline) throw new Error('Conecte-se para alterar a visibilidade do destaque.')
+        await syncPendingReading(requestAccount, account, id)
+        await syncReadingChanges(requestAccount, account, id)
+        const { highlight } = await requestAccount(`/books/${id}/highlights/${highlightId}`, { method: 'PATCH', data: changes })
+        session.highlights.set(highlightId, highlight)
+        await rememberMarks()
         return highlight
       },
       loadNotes: async (markId, { signal: noteSignal } = {}) => {
         if (sample || session.preview) return localHighlightNotes(localMark(markId))
-        if (localMark(markId)) await syncPendingReading(api, account, id).catch(() => {})
-        return (await readRequest(notesPath(markId), noteSignal)).notes
+        return readNotes(markId, noteSignal)
       },
       addNote: (markId, data) => saveNote(markId, null, data),
       updateNote: (markId, noteId, data) => saveNote(markId, noteId, data),
@@ -919,8 +1236,9 @@ async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
           saveLocalMark(markId, deleteLocalNote(localMark(markId), noteId))
           return
         }
-        await syncPendingReading(api, account, id).catch(() => {})
-        await api(`${notesPath(markId)}/${noteId}`, { method: 'DELETE' })
+        const notes = await readOfflineNotes(account, id, markId) ?? localHighlightNotes(session.highlights.get(markId))
+        await writeReading({ kind: 'remove-note', markId, noteId })
+        await saveOfflineNotes(account, id, markId, applyPendingNotes(account, id, markId, notes).filter(note => note.id !== noteId))
       },
       onRemoveHighlight: async highlightId => {
         if (sample) {
@@ -930,28 +1248,35 @@ async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
         }
         if (session.preview) {
           removePendingHighlight(account, id, highlightId)
+          session.highlights.delete(highlightId)
           return
         }
-        await syncPendingReading(api, account, id).catch(() => {})
-        await api(`/books/${id}/highlights/${highlightId}`, { method: 'DELETE' }).catch(error => {
-          if (error.status !== 404) throw error
-        })
+        await writeReading({ kind: 'remove-highlight', markId: highlightId })
         removePendingHighlight(account, id, highlightId)
+        session.highlights.delete(highlightId)
+        await rememberMarks()
+        await saveOfflineNotes(account, id, highlightId, [])
         setBooks(books.map(item => item.id === id ? { ...item, highlightCount: Math.max(0, (item.highlightCount ?? 1) - 1) } : item))
       },
     })
+    mounted = true
     recordReaderRoute(id)
     if (openingBook === controller) openingBook = undefined
     if (dialog.open && dialog.dataset.view === 'open-book') dialog.close()
-    if (!session.preview && !sample && (pending.position || pending.highlights.length)) {
-      void syncPendingReading(api, account, id).catch(error => { if (readerSession === session) announce(error.message) })
+    if (!offline && !session.preview && !sample && (pending.position || pending.highlights.length)) {
+      void syncPendingReading(requestAccount, account, id).catch(error => { if (readerSession === session) announce(error.message) })
     }
     if (book.nextHighlightOffset != null) {
-      void listAll(`/books/${id}/highlights`, 'highlights', book.nextHighlightOffset, readRequest)
+      void listAll(`/books/${id}/highlights`, 'highlights', book.nextHighlightOffset, path => readRequest(path, undefined, account))
         .then(additionalHighlights => {
-          if (readerSession === session) readerCleanup.updateBook({ additionalHighlights })
+          if (readerSession !== session) return
+          const merged = applyPendingHighlights(account, id, [...additionalHighlights, ...session.highlights.values()])
+          session.highlights = new Map(merged.map(mark => [mark.id, mark]))
+          void rememberMarks()
+          readerCleanup.updateBook({ highlights: merged })
         }).catch(error => { if (readerSession === session) announce(error.message) })
     }
+    if (book.offlineFallback) announce('Mostrando a página salva mais próxima.')
     if (explicitPage !== undefined) void savePosition(position, explicitAnchor).catch(error => announce(error.message))
     window.scrollTo(0, 0)
   } catch (error) {
@@ -959,6 +1284,7 @@ async function openBook(id, explicitPage, explicitAnchor, initialHighlightId) {
       showOpenFailure(error, () => void openBook(id, explicitPage, explicitAnchor, initialHighlightId), moduleFailed)
     }
   } finally {
+    if (!mounted) cache?.cleanup()
     if (openingBook === controller) {
       openingBook = undefined
       controller.abort()
@@ -1010,7 +1336,14 @@ window.addEventListener('popstate', () => {
   }
 })
 
-window.addEventListener('focus', () => void refreshVisibleLibrary())
+window.addEventListener('offline', () => setOffline(true))
+window.addEventListener('online', () => void reconnect())
+window.addEventListener('focus', () => {
+  if (navigator.onLine) void reconnect()
+})
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && offline && navigator.onLine) void reconnect()
+})
 
 dialog.addEventListener('click', async event => {
   const button = event.target.closest('button')
@@ -1050,14 +1383,15 @@ dialog.addEventListener('click', async event => {
     }
   }
   if (action !== 'logout') return
+  if (offline || !navigator.onLine) return announce('Conecte-se para sair da sua conta.')
   button.disabled = true
   try {
+    const account = user?.id
+    if (account) await syncAccountReading(account)
     await imports.setAccount(null)
-    await api('/logout', { method: 'POST' })
-    user = null
-    setBooks([])
-    highlightPalette = []
-    setThemeAccount(null)
+    await api('/logout', { method: 'POST', account })
+    sessionRevision++
+    await useSession(null, null, { verified: true })
     dialog.close()
     renderShell()
   } catch (error) {
@@ -1069,16 +1403,5 @@ dialog.addEventListener('click', async event => {
 })
 
 renderShell()
-try {
-  user = (await api('/session')).user
-  if (user) {
-    void refreshPalette(user.id)
-    setThemeAccount(user.id)
-  }
-  try { await refreshBooks() } catch (error) { announce(error.message) }
-  if (user && !readerBook) renderShell()
-  await setupImports()
-  openCurrentRoute()
-} catch (error) {
-  announce(error.message)
-}
+await reconnect({ initial: true })
+if (!readerBook && !openingBook) openCurrentRoute()

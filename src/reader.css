@@ -312,6 +312,16 @@
   line-height: 1.2;
 }
 
+.lr-offline {
+  position: absolute;
+  right: clamp(12px, 4vw, 60px);
+  max-width: calc(50% - 48px);
+  color: var(--lr-muted);
+  font-size: .8125rem;
+  line-height: 1.2;
+  text-align: end;
+}
+
 .lr-navigation {
   position: absolute;
   z-index: 2;

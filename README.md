@@ -46,6 +46,12 @@ O servidor cria as tabelas na primeira operação que precisa do banco. Na Verce
 - Use a lixeira no cartão de um PDF para apagá-lo da biblioteca. A confirmação também remove o progresso e os destaques daquele livro.
 - Selecione o texto e use **Destacar** para marcar com uma das três cores iniciais. Use **Outras cores** para escolher ou cadastrar mais cores. Toque no trecho já destacado para remover a marcação ou adicionar, editar e remover suas notas.
 
+## Leitura offline
+
+- No celular, abra o Margem no navegador e use **Instalar app** ou **Adicionar à Tela de Início**. Faça o primeiro acesso com internet para preparar o app e carregar a conta e a biblioteca neste dispositivo.
+- Abra um livro com internet para salvar a página atual e até duas páginas de cada lado. A biblioteca indica os livros com páginas salvas. O cache mantém até três livros recentes, dentro do espaço disponível no navegador.
+- Sem conexão, o Margem abre a biblioteca salva e permite ler as páginas disponíveis, marcar trechos e anotar. Ao voltar à internet com o app aberto, ou ao abri-lo novamente conectado, o progresso, os destaques e as notas pessoais são sincronizados com a conta.
+
 ## Social
 
 - Copie seu ID na aba **Social** e use o ID de outra pessoa para enviar um pedido de amizade. Após o aceite, vocês podem visitar os perfis e ver os livros e o progresso um do outro.

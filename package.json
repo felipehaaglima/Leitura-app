@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev": "node scripts/dev.mjs",
-    "build": "node scripts/assets.mjs && vite build",
+    "build": "node scripts/assets.mjs && vite build --manifest && node scripts/pwa.mjs",
     "start": "node server/index.js"
   },
   "dependencies": {
